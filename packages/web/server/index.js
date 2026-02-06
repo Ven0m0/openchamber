@@ -16,6 +16,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const DEFAULT_PORT = 3000;
+const DESKTOP_NOTIFY_PREFIX = '[OpenChamberDesktopNotify] ';
+const uiNotificationClients = new Set();
 const HEALTH_CHECK_INTERVAL = 15000;
 const SHUTDOWN_TIMEOUT = 10000;
 const MODELS_DEV_API_URL = 'https://models.dev/api.json';
@@ -796,6 +798,29 @@ const normalizeStringArray = (input) => {
   );
 };
 
+const sanitizeModelRefs = (input, limit) => {
+  if (!Array.isArray(input)) {
+    return undefined;
+  }
+
+  const result = [];
+  const seen = new Set();
+
+  for (const entry of input) {
+    if (!entry || typeof entry !== 'object') continue;
+    const providerID = typeof entry.providerID === 'string' ? entry.providerID.trim() : '';
+    const modelID = typeof entry.modelID === 'string' ? entry.modelID.trim() : '';
+    if (!providerID || !modelID) continue;
+    const key = `${providerID}/${modelID}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ providerID, modelID });
+    if (result.length >= limit) break;
+  }
+
+  return result;
+};
+
 const sanitizeSkillCatalogs = (input) => {
   if (!Array.isArray(input)) {
     return undefined;
@@ -884,6 +909,10 @@ const sanitizeProjects = (input) => {
       }
     }
 
+    if (typeof candidate.sidebarCollapsed === 'boolean') {
+      project.sidebarCollapsed = candidate.sidebarCollapsed;
+    }
+
     result.push(project);
   }
 
@@ -919,6 +948,14 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.homeDirectory === 'string' && candidate.homeDirectory.length > 0) {
     result.homeDirectory = candidate.homeDirectory;
   }
+
+  // Absolute path to the opencode CLI binary (optional override).
+  // Accept empty-string to clear (we persist an empty string sentinel so the running
+  // process can reliably drop a previously applied OPENCODE_BINARY override).
+  if (typeof candidate.opencodeBinary === 'string') {
+    const normalized = normalizeDirectoryPath(candidate.opencodeBinary).trim();
+    result.opencodeBinary = normalized;
+  }
   if (Array.isArray(candidate.projects)) {
     const projects = sanitizeProjects(candidate.projects);
     if (projects) {
@@ -938,6 +975,7 @@ const sanitizeSettingsUpdate = (payload) => {
   if (Array.isArray(candidate.pinnedDirectories)) {
     result.pinnedDirectories = normalizeStringArray(candidate.pinnedDirectories);
   }
+
 
   if (typeof candidate.uiFont === 'string' && candidate.uiFont.length > 0) {
     result.uiFont = candidate.uiFont;
@@ -1034,6 +1072,9 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.fontSize === 'number' && Number.isFinite(candidate.fontSize)) {
     result.fontSize = Math.max(50, Math.min(200, Math.round(candidate.fontSize)));
   }
+  if (typeof candidate.terminalFontSize === 'number' && Number.isFinite(candidate.terminalFontSize)) {
+    result.terminalFontSize = Math.max(9, Math.min(52, Math.round(candidate.terminalFontSize)));
+  }
   if (typeof candidate.padding === 'number' && Number.isFinite(candidate.padding)) {
     result.padding = Math.max(50, Math.min(200, Math.round(candidate.padding)));
   }
@@ -1042,6 +1083,16 @@ const sanitizeSettingsUpdate = (payload) => {
   }
   if (typeof candidate.inputBarOffset === 'number' && Number.isFinite(candidate.inputBarOffset)) {
     result.inputBarOffset = Math.max(0, Math.min(100, Math.round(candidate.inputBarOffset)));
+  }
+
+  const favoriteModels = sanitizeModelRefs(candidate.favoriteModels, 64);
+  if (favoriteModels) {
+    result.favoriteModels = favoriteModels;
+  }
+
+  const recentModels = sanitizeModelRefs(candidate.recentModels, 16);
+  if (recentModels) {
+    result.recentModels = recentModels;
   }
   if (typeof candidate.diffLayoutPreference === 'string') {
     const mode = candidate.diffLayoutPreference.trim();
@@ -1302,14 +1353,59 @@ const migrateSettingsFromLegacyThemePreferences = async (current) => {
   return { settings: merged, changed: true };
 };
 
+const migrateSettingsFromLegacyCollapsedProjects = async (current) => {
+  const settings = current && typeof current === 'object' ? current : {};
+  const collapsed = Array.isArray(settings.collapsedProjects)
+    ? normalizeStringArray(settings.collapsedProjects)
+    : [];
+
+  if (collapsed.length === 0 || !Array.isArray(settings.projects)) {
+    if (collapsed.length === 0) {
+      return { settings, changed: false };
+    }
+    // Nothing to apply to; drop legacy key.
+    const next = { ...settings };
+    delete next.collapsedProjects;
+    return { settings: next, changed: true };
+  }
+
+  const set = new Set(collapsed);
+  const projects = sanitizeProjects(settings.projects) || [];
+  let changed = false;
+
+  const nextProjects = projects.map((project) => {
+    const shouldCollapse = set.has(project.id);
+    if (project.sidebarCollapsed !== shouldCollapse) {
+      changed = true;
+      return { ...project, sidebarCollapsed: shouldCollapse };
+    }
+    return project;
+  });
+
+  if (!changed) {
+    // Still drop legacy key if present.
+    if (Object.prototype.hasOwnProperty.call(settings, 'collapsedProjects')) {
+      const next = { ...settings };
+      delete next.collapsedProjects;
+      return { settings: next, changed: true };
+    }
+    return { settings, changed: false };
+  }
+
+  const next = { ...settings, projects: nextProjects };
+  delete next.collapsedProjects;
+  return { settings: next, changed: true };
+};
+
 const readSettingsFromDiskMigrated = async () => {
   const current = await readSettingsFromDisk();
   const migration1 = await migrateSettingsFromLegacyLastDirectory(current);
   const migration2 = await migrateSettingsFromLegacyThemePreferences(migration1.settings);
-  if (migration1.changed || migration2.changed) {
-    await writeSettingsToDisk(migration2.settings);
+  const migration3 = await migrateSettingsFromLegacyCollapsedProjects(migration2.settings);
+  if (migration1.changed || migration2.changed || migration3.changed) {
+    await writeSettingsToDisk(migration3.settings);
   }
-  return migration2.settings;
+  return migration3.settings;
 };
 
 const getOrCreateVapidKeys = async () => {
@@ -1531,20 +1627,25 @@ const sessionActivityCooldowns = new Map(); // sessionId -> timeoutId
 const SESSION_COOLDOWN_DURATION_MS = 2000;
 
 const setSessionActivityPhase = (sessionId, phase) => {
-  if (!sessionId || typeof sessionId !== 'string') return;
-  
-  // Cancel existing cooldown timer
+  if (!sessionId || typeof sessionId !== 'string') return false;
+
+  const current = sessionActivityPhases.get(sessionId);
+  if (current?.phase === phase) return false; // No change
+
+  // Match desktop semantics: only enter cooldown from busy.
+  if (phase === 'cooldown' && current?.phase !== 'busy') {
+    return false;
+  }
+
+  // Cancel existing cooldown timer only on phase change.
   const existingTimer = sessionActivityCooldowns.get(sessionId);
   if (existingTimer) {
     clearTimeout(existingTimer);
     sessionActivityCooldowns.delete(sessionId);
   }
-  
-  const current = sessionActivityPhases.get(sessionId);
-  if (current?.phase === phase) return; // No change
-  
+
   sessionActivityPhases.set(sessionId, { phase, updatedAt: Date.now() });
-  
+
   // Schedule transition from cooldown to idle
   if (phase === 'cooldown') {
     const timer = setTimeout(() => {
@@ -1556,6 +1657,8 @@ const setSessionActivityPhase = (sessionId, phase) => {
     }, SESSION_COOLDOWN_DURATION_MS);
     sessionActivityCooldowns.set(sessionId, timer);
   }
+
+  return true;
 };
 
 const getSessionActivitySnapshot = () => {
@@ -1588,14 +1691,24 @@ const resolveVapidSubject = async () => {
 
   const originEnv = process.env.OPENCHAMBER_PUBLIC_ORIGIN;
   if (typeof originEnv === 'string' && originEnv.trim().length > 0) {
-    return originEnv.trim();
+    const trimmed = originEnv.trim();
+    // Convert http://localhost to mailto for VAPID compatibility
+    if (trimmed.startsWith('http://localhost')) {
+      return 'mailto:openchamber@localhost';
+    }
+    return trimmed;
   }
 
   try {
     const settings = await readSettingsFromDiskMigrated();
     const stored = settings?.publicOrigin;
     if (typeof stored === 'string' && stored.trim().length > 0) {
-      return stored.trim();
+      const trimmed = stored.trim();
+      // Convert http://localhost to mailto for VAPID compatibility
+      if (trimmed.startsWith('http://localhost')) {
+        return 'mailto:openchamber@localhost';
+      }
+      return trimmed;
     }
   } catch {
     // ignore
@@ -1748,7 +1861,8 @@ const ENV_CONFIGURED_OPENCODE_PORT = (() => {
 })();
 
 const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
-                                   process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
+                                    process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
+const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
 
 const ENV_CONFIGURED_API_PREFIX = normalizeApiPrefix(
   process.env.OPENCODE_API_PREFIX || process.env.OPENCHAMBER_API_PREFIX || ''
@@ -1759,6 +1873,477 @@ const ENV_CONFIGURED_API_PREFIX = normalizeApiPrefix(
 }
 
 let globalEventWatcherAbortController = null;
+
+let resolvedOpencodeBinary = null;
+let resolvedOpencodeBinarySource = null;
+let resolvedNodeBinary = null;
+let resolvedBunBinary = null;
+
+function isExecutable(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    if (process.platform === 'win32') {
+      const ext = path.extname(filePath).toLowerCase();
+      if (!ext) return true;
+      return ['.exe', '.cmd', '.bat', '.com'].includes(ext);
+    }
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function prependToPath(dir) {
+  const trimmed = typeof dir === 'string' ? dir.trim() : '';
+  if (!trimmed) return;
+  const current = process.env.PATH || '';
+  const parts = current.split(path.delimiter).filter(Boolean);
+  if (parts.includes(trimmed)) return;
+  process.env.PATH = [trimmed, ...parts].join(path.delimiter);
+}
+
+function searchPathFor(binaryName) {
+  const current = process.env.PATH || '';
+  const parts = current.split(path.delimiter).filter(Boolean);
+  for (const dir of parts) {
+    const candidate = path.join(dir, binaryName);
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveOpencodeCliPath() {
+  const explicit = [
+    process.env.OPENCODE_BINARY,
+    process.env.OPENCODE_PATH,
+    process.env.OPENCHAMBER_OPENCODE_PATH,
+    process.env.OPENCHAMBER_OPENCODE_BIN,
+  ]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
+
+  for (const candidate of explicit) {
+    if (isExecutable(candidate)) {
+      resolvedOpencodeBinarySource = 'env';
+      return candidate;
+    }
+  }
+
+  const resolvedFromPath = searchPathFor('opencode');
+  if (resolvedFromPath) {
+    resolvedOpencodeBinarySource = 'path';
+    return resolvedFromPath;
+  }
+
+  const home = os.homedir();
+  const unixFallbacks = [
+    path.join(home, '.opencode', 'bin', 'opencode'),
+    path.join(home, '.bun', 'bin', 'opencode'),
+    path.join(home, '.local', 'bin', 'opencode'),
+    path.join(home, 'bin', 'opencode'),
+    '/opt/homebrew/bin/opencode',
+    '/usr/local/bin/opencode',
+    '/usr/bin/opencode',
+    '/bin/opencode',
+  ];
+
+  const winFallbacks = (() => {
+    const userProfile = process.env.USERPROFILE || home;
+    const appData = process.env.APPDATA || '';
+    const localAppData = process.env.LOCALAPPDATA || '';
+    const programData = process.env.ProgramData || 'C:\\ProgramData';
+
+    return [
+      path.join(userProfile, '.opencode', 'bin', 'opencode.exe'),
+      path.join(userProfile, '.opencode', 'bin', 'opencode.cmd'),
+      path.join(appData, 'npm', 'opencode.cmd'),
+      path.join(userProfile, 'scoop', 'shims', 'opencode.cmd'),
+      path.join(programData, 'chocolatey', 'bin', 'opencode.exe'),
+      path.join(programData, 'chocolatey', 'bin', 'opencode.cmd'),
+      path.join(userProfile, '.bun', 'bin', 'opencode.exe'),
+      path.join(userProfile, '.bun', 'bin', 'opencode.cmd'),
+      localAppData ? path.join(localAppData, 'Programs', 'opencode', 'opencode.exe') : '',
+    ].filter(Boolean);
+  })();
+
+  const fallbacks = process.platform === 'win32' ? winFallbacks : unixFallbacks;
+  for (const candidate of fallbacks) {
+    if (isExecutable(candidate)) {
+      resolvedOpencodeBinarySource = 'fallback';
+      return candidate;
+    }
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const result = spawnSync('where', ['opencode'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const lines = (result.stdout || '')
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+        const found = lines.find((line) => isExecutable(line));
+        if (found) {
+          resolvedOpencodeBinarySource = 'where';
+          return found;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  const shells = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'].filter(Boolean);
+  for (const shell of shells) {
+    if (!isExecutable(shell)) continue;
+    try {
+      const result = spawnSync(shell, ['-lic', 'command -v opencode'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
+        if (found && isExecutable(found)) {
+          resolvedOpencodeBinarySource = 'shell';
+          return found;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return null;
+}
+
+function resolveNodeCliPath() {
+  const explicit = [process.env.NODE_BINARY, process.env.OPENCHAMBER_NODE_BINARY]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
+
+  for (const candidate of explicit) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  const resolvedFromPath = searchPathFor('node');
+  if (resolvedFromPath) {
+    return resolvedFromPath;
+  }
+
+  const unixFallbacks = [
+    '/opt/homebrew/bin/node',
+    '/usr/local/bin/node',
+    '/usr/bin/node',
+    '/bin/node',
+  ];
+  for (const candidate of unixFallbacks) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const result = spawnSync('where', ['node'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const lines = (result.stdout || '')
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+        const found = lines.find((line) => isExecutable(line));
+        if (found) return found;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  const shells = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'].filter(Boolean);
+  for (const shell of shells) {
+    if (!isExecutable(shell)) continue;
+    try {
+      const result = spawnSync(shell, ['-lic', 'command -v node'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
+        if (found && isExecutable(found)) {
+          return found;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return null;
+}
+
+function resolveBunCliPath() {
+  const explicit = [process.env.BUN_BINARY, process.env.OPENCHAMBER_BUN_BINARY]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
+
+  for (const candidate of explicit) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  const resolvedFromPath = searchPathFor('bun');
+  if (resolvedFromPath) {
+    return resolvedFromPath;
+  }
+
+  const home = os.homedir();
+  const unixFallbacks = [
+    path.join(home, '.bun', 'bin', 'bun'),
+    '/opt/homebrew/bin/bun',
+    '/usr/local/bin/bun',
+    '/usr/bin/bun',
+    '/bin/bun',
+  ];
+  for (const candidate of unixFallbacks) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  if (process.platform === 'win32') {
+    const userProfile = process.env.USERPROFILE || home;
+    const winFallbacks = [
+      path.join(userProfile, '.bun', 'bin', 'bun.exe'),
+      path.join(userProfile, '.bun', 'bin', 'bun.cmd'),
+    ];
+    for (const candidate of winFallbacks) {
+      if (isExecutable(candidate)) return candidate;
+    }
+
+    try {
+      const result = spawnSync('where', ['bun'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const lines = (result.stdout || '')
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+        const found = lines.find((line) => isExecutable(line));
+        if (found) return found;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  const shells = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'].filter(Boolean);
+  for (const shell of shells) {
+    if (!isExecutable(shell)) continue;
+    try {
+      const result = spawnSync(shell, ['-lic', 'command -v bun'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
+        if (found && isExecutable(found)) {
+          return found;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return null;
+}
+
+function ensureBunCliEnv() {
+  if (resolvedBunBinary) {
+    return resolvedBunBinary;
+  }
+
+  const resolved = resolveBunCliPath();
+  if (resolved) {
+    prependToPath(path.dirname(resolved));
+    resolvedBunBinary = resolved;
+    return resolved;
+  }
+
+  return null;
+}
+
+function ensureNodeCliEnv() {
+  if (resolvedNodeBinary) {
+    return resolvedNodeBinary;
+  }
+
+  const resolved = resolveNodeCliPath();
+  if (resolved) {
+    prependToPath(path.dirname(resolved));
+    resolvedNodeBinary = resolved;
+    return resolved;
+  }
+
+  return null;
+}
+
+function readShebang(opencodePath) {
+  if (!opencodePath || typeof opencodePath !== 'string') {
+    return null;
+  }
+  try {
+    // Best effort: detect "#!/usr/bin/env <runtime>" without reading whole file.
+    const fd = fs.openSync(opencodePath, 'r');
+    try {
+      const buf = Buffer.alloc(256);
+      const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+      const head = buf.subarray(0, bytes).toString('utf8');
+      const firstLine = head.split(/\r?\n/, 1)[0] || '';
+      if (!firstLine.startsWith('#!')) {
+        return null;
+      }
+      const shebang = firstLine.slice(2).trim();
+      if (!shebang) {
+        return null;
+      }
+      return shebang;
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    return null;
+  }
+}
+
+function opencodeShimInterpreter(opencodePath) {
+  const shebang = readShebang(opencodePath);
+  if (!shebang) return null;
+  if (/\bnode\b/i.test(shebang)) return 'node';
+  if (/\bbun\b/i.test(shebang)) return 'bun';
+  return null;
+}
+
+function ensureOpencodeShimRuntime(opencodePath) {
+  const runtime = opencodeShimInterpreter(opencodePath);
+  if (runtime === 'node') {
+    ensureNodeCliEnv();
+  }
+  if (runtime === 'bun') {
+    ensureBunCliEnv();
+  }
+}
+
+function normalizeOpencodeBinarySetting(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = normalizeDirectoryPath(raw).trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  try {
+    const stat = fs.statSync(trimmed);
+    if (stat.isDirectory()) {
+      const bin = process.platform === 'win32' ? 'opencode.exe' : 'opencode';
+      return path.join(trimmed, bin);
+    }
+  } catch {
+    // ignore
+  }
+
+  return trimmed;
+}
+
+async function applyOpencodeBinaryFromSettings() {
+  try {
+    const settings = await readSettingsFromDiskMigrated();
+    if (!settings || typeof settings !== 'object') {
+      return null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(settings, 'opencodeBinary')) {
+      return null;
+    }
+
+    const normalized = normalizeOpencodeBinarySetting(settings.opencodeBinary);
+
+    if (normalized === '') {
+      delete process.env.OPENCODE_BINARY;
+      resolvedOpencodeBinary = null;
+      resolvedOpencodeBinarySource = null;
+      return null;
+    }
+
+    if (normalized && isExecutable(normalized)) {
+      process.env.OPENCODE_BINARY = normalized;
+      prependToPath(path.dirname(normalized));
+      resolvedOpencodeBinary = normalized;
+      resolvedOpencodeBinarySource = 'settings';
+      ensureOpencodeShimRuntime(normalized);
+      return normalized;
+    }
+
+    const raw = typeof settings.opencodeBinary === 'string' ? settings.opencodeBinary.trim() : '';
+    if (raw) {
+      console.warn(`Configured settings.opencodeBinary is not executable: ${raw}`);
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+function ensureOpencodeCliEnv() {
+  if (resolvedOpencodeBinary) {
+    ensureOpencodeShimRuntime(resolvedOpencodeBinary);
+    return resolvedOpencodeBinary;
+  }
+
+  const existing = typeof process.env.OPENCODE_BINARY === 'string' ? process.env.OPENCODE_BINARY.trim() : '';
+  if (existing && isExecutable(existing)) {
+    resolvedOpencodeBinary = existing;
+    resolvedOpencodeBinarySource = resolvedOpencodeBinarySource || 'env';
+    prependToPath(path.dirname(existing));
+    ensureOpencodeShimRuntime(existing);
+    return resolvedOpencodeBinary;
+  }
+
+  const resolved = resolveOpencodeCliPath();
+  if (resolved) {
+    process.env.OPENCODE_BINARY = resolved;
+    prependToPath(path.dirname(resolved));
+    ensureOpencodeShimRuntime(resolved);
+    resolvedOpencodeBinary = resolved;
+    resolvedOpencodeBinarySource = resolvedOpencodeBinarySource || 'unknown';
+    console.log(`Resolved opencode CLI: ${resolved}`);
+    return resolved;
+  }
+
+  return null;
+}
 
 const startGlobalEventWatcher = async () => {
   if (globalEventWatcherAbortController) {
@@ -1813,9 +2398,11 @@ const startGlobalEventWatcher = async () => {
             const payload = parseSseDataPayload(block);
             void maybeSendPushForTrigger(payload);
             // Track session activity independently of UI (mirrors Tauri desktop behavior)
-            const activity = deriveSessionActivity(payload);
-            if (activity) {
-              setSessionActivityPhase(activity.sessionId, activity.phase);
+            const transitions = deriveSessionActivityTransitions(payload);
+            if (transitions && transitions.length > 0) {
+              for (const activity of transitions) {
+                setSessionActivityPhase(activity.sessionId, activity.phase);
+              }
             }
           }
         }
@@ -2062,9 +2649,70 @@ function parseSseDataPayload(block) {
   }
 }
 
-function deriveSessionActivity(payload) {
+function emitDesktopNotification(payload) {
+  if (!ENV_DESKTOP_NOTIFY) {
+    return;
+  }
+
   if (!payload || typeof payload !== 'object') {
-    return null;
+    return;
+  }
+
+  try {
+    // One-line protocol consumed by the Tauri shell.
+    process.stdout.write(`${DESKTOP_NOTIFY_PREFIX}${JSON.stringify(payload)}\n`);
+  } catch {
+    // ignore
+  }
+}
+
+function broadcastUiNotification(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+
+  if (uiNotificationClients.size === 0) {
+    return;
+  }
+
+  for (const res of uiNotificationClients) {
+    try {
+      writeSseEvent(res, {
+        type: 'openchamber:notification',
+        properties: payload,
+      });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function isStreamingAssistantPart(properties) {
+  if (!properties || typeof properties !== 'object') {
+    return false;
+  }
+
+  const info = properties?.info;
+  const role = info?.role;
+  if (role !== 'assistant') {
+    return false;
+  }
+
+  const part = properties?.part;
+  const partType = part?.type;
+  return (
+    partType === 'step-start' ||
+    partType === 'text' ||
+    partType === 'tool' ||
+    partType === 'reasoning' ||
+    partType === 'file' ||
+    partType === 'patch'
+  );
+}
+
+function deriveSessionActivityTransitions(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return [];
   }
 
   if (payload.type === 'session.status') {
@@ -2074,7 +2722,7 @@ function deriveSessionActivity(payload) {
 
     if (typeof sessionId === 'string' && sessionId.length > 0 && typeof statusType === 'string') {
       const phase = statusType === 'busy' || statusType === 'retry' ? 'busy' : 'idle';
-      return { sessionId, phase };
+      return [{ sessionId, phase }];
     }
   }
 
@@ -2084,7 +2732,7 @@ function deriveSessionActivity(payload) {
     const role = info?.role;
     const finish = info?.finish;
     if (typeof sessionId === 'string' && sessionId.length > 0 && role === 'assistant' && finish === 'stop') {
-      return { sessionId, phase: 'cooldown' };
+      return [{ sessionId, phase: 'cooldown' }];
     }
   }
 
@@ -2093,19 +2741,32 @@ function deriveSessionActivity(payload) {
     const sessionId = info?.sessionID ?? info?.sessionId ?? payload.properties?.sessionID ?? payload.properties?.sessionId;
     const role = info?.role;
     const finish = info?.finish;
-    if (typeof sessionId === 'string' && sessionId.length > 0 && role === 'assistant' && finish === 'stop') {
-      return { sessionId, phase: 'cooldown' };
+
+    if (typeof sessionId === 'string' && sessionId.length > 0 && role === 'assistant') {
+      const transitions = [];
+
+      // Desktop parity: mark busy when we see assistant parts streaming.
+      if (isStreamingAssistantPart(payload.properties)) {
+        transitions.push({ sessionId, phase: 'busy' });
+      }
+
+      // Desktop parity: enter cooldown when finish==stop.
+      if (finish === 'stop') {
+        transitions.push({ sessionId, phase: 'cooldown' });
+      }
+
+      return transitions;
     }
   }
 
   if (payload.type === 'session.idle') {
     const sessionId = payload.properties?.sessionID ?? payload.properties?.sessionId;
     if (typeof sessionId === 'string' && sessionId.length > 0) {
-      return { sessionId, phase: 'idle' };
+      return [{ sessionId, phase: 'idle' }];
     }
   }
 
-  return null;
+  return [];
 }
 
 const PUSH_READY_COOLDOWN_MS = 5000;
@@ -2223,6 +2884,7 @@ const maybeSendPushForTrigger = async (payload) => {
     if (info?.role === 'assistant' && info?.finish === 'stop' && sessionId) {
       // Check if this is a subtask and if we should notify for subtasks
       const settings = await readSettingsFromDisk();
+
       if (settings.notifyOnSubtasks === false) {
         // Prefer parentID on payload (if present), else fetch from sessions list.
         const sessionInfo = payload.properties?.session;
@@ -2246,6 +2908,19 @@ const maybeSendPushForTrigger = async (payload) => {
 
       const title = `${formatMode(info?.mode)} agent is ready`;
       const body = `${formatModelId(info?.modelID)} completed the task`;
+
+      if (settings.nativeNotificationsEnabled) {
+        const payload = {
+          title,
+          body,
+          tag: `ready-${sessionId}`,
+          kind: 'ready',
+          sessionId,
+          requireHidden: settings.notificationMode !== 'always',
+        };
+        emitDesktopNotification(payload);
+        broadcastUiNotification(payload);
+      }
 
       await sendPushToAllUiSessions(
         {
@@ -2274,6 +2949,40 @@ const maybeSendPushForTrigger = async (payload) => {
 
     const timer = setTimeout(() => {
       pushQuestionDebounceTimers.delete(sessionId);
+
+      void readSettingsFromDisk().then((settings) => {
+        if (!settings.nativeNotificationsEnabled) {
+          return;
+        }
+
+        const firstQuestion = payload.properties?.questions?.[0];
+        const header = typeof firstQuestion?.header === 'string' ? firstQuestion.header.trim() : '';
+        const questionText = typeof firstQuestion?.question === 'string' ? firstQuestion.question.trim() : '';
+        const title = /plan\s*mode/i.test(header)
+          ? 'Switch to plan mode'
+          : /build\s*agent/i.test(header)
+            ? 'Switch to build mode'
+            : header || 'Input needed';
+        const body = questionText || 'Agent is waiting for your response';
+
+        emitDesktopNotification({
+          kind: 'question',
+          title,
+          body,
+          tag: `question-${sessionId}`,
+          sessionId,
+          requireHidden: settings.notificationMode !== 'always',
+        });
+
+        broadcastUiNotification({
+          kind: 'question',
+          title,
+          body,
+          tag: `question-${sessionId}`,
+          sessionId,
+          requireHidden: settings.notificationMode !== 'always',
+        });
+      });
 
       const firstQuestion = payload.properties?.questions?.[0];
       const header = typeof firstQuestion?.header === 'string' ? firstQuestion.header.trim() : '';
@@ -2319,6 +3028,36 @@ const maybeSendPushForTrigger = async (payload) => {
 
     const timer = setTimeout(() => {
       pushPermissionDebounceTimers.delete(sessionId);
+      void readSettingsFromDisk().then((settings) => {
+        if (!settings.nativeNotificationsEnabled) {
+          return;
+        }
+
+        const title = 'Permission required';
+        const sessionTitle = payload.properties?.sessionTitle;
+        const body = typeof sessionTitle === 'string' && sessionTitle.trim().length > 0
+          ? sessionTitle.trim()
+          : 'Agent is waiting for your approval';
+
+        emitDesktopNotification({
+          kind: 'permission',
+          title,
+          body,
+          tag: requestKey ? `permission-${requestKey}` : `permission-${sessionId}`,
+          sessionId,
+          requireHidden: settings.notificationMode !== 'always',
+        });
+
+        broadcastUiNotification({
+          kind: 'permission',
+          title,
+          body,
+          tag: requestKey ? `permission-${requestKey}` : `permission-${sessionId}`,
+          sessionId,
+          requireHidden: settings.notificationMode !== 'always',
+        });
+      });
+
       if (requestKey) {
         notifiedPermissionRequests.add(requestKey);
       }
@@ -2450,6 +3189,9 @@ async function startOpenCode() {
   );
   // Note: SDK starts in current process CWD. openCodeWorkingDirectory is tracked but not used for spawn in SDK.
 
+  await applyOpencodeBinaryFromSettings();
+  ensureOpencodeCliEnv();
+
   try {
     const serverInstance = await createOpencodeServer({
       hostname: '127.0.0.1',
@@ -2487,10 +3229,11 @@ async function startOpenCode() {
       throw new Error('Server started but health check failed (timeout)');
     }
   } catch (error) {
-    lastOpenCodeError = error.message;
+    const message = error instanceof Error ? error.message : String(error);
+    lastOpenCodeError = message;
     openCodePort = null;
     syncToHmrState();
-    console.error(`Failed to start OpenCode: ${error.message}`);
+    console.error(`Failed to start OpenCode: ${message}`);
     throw error;
   }
 }
@@ -2736,6 +3479,11 @@ async function refreshOpenCodeAfterConfigChange(reason, options = {}) {
   const { agentName } = options;
 
   console.log(`Refreshing OpenCode after ${reason}`);
+
+  // Settings might include a new opencodeBinary; drop cache before restart.
+  resolvedOpencodeBinary = null;
+  await applyOpencodeBinaryFromSettings();
+
   await restartOpenCode();
 
   try {
@@ -2759,13 +3507,15 @@ async function refreshOpenCodeAfterConfigChange(reason, options = {}) {
 }
 
 function setupProxy(app) {
-  if (!openCodePort) return;
-
   if (app.get('opencodeProxyConfigured')) {
     return;
   }
 
-  console.log(`Setting up proxy to OpenCode on port ${openCodePort}`);
+  if (openCodePort) {
+    console.log(`Setting up proxy to OpenCode on port ${openCodePort}`);
+  } else {
+    console.log('Setting up OpenCode API gate (OpenCode not started yet)');
+  }
   app.set('opencodeProxyConfigured', true);
 
   app.use('/api', (req, res, next) => {
@@ -2773,6 +3523,7 @@ function setupProxy(app) {
       req.path.startsWith('/themes/custom') ||
       req.path.startsWith('/push') ||
       req.path.startsWith('/config/agents') ||
+      req.path.startsWith('/config/opencode-resolution') ||
       req.path.startsWith('/config/settings') ||
       req.path.startsWith('/config/skills') ||
       req.path === '/config/reload' ||
@@ -2806,6 +3557,7 @@ function setupProxy(app) {
     if (
       req.path.startsWith('/themes/custom') ||
       req.path.startsWith('/config/agents') ||
+      req.path.startsWith('/config/opencode-resolution') ||
       req.path.startsWith('/config/settings') ||
       req.path.startsWith('/config/skills') ||
       req.path === '/health'
@@ -2982,7 +3734,12 @@ async function main(options = {}) {
       openCodeApiPrefix: '',
       openCodeApiPrefixDetected: true,
       isOpenCodeReady,
-      lastOpenCodeError
+      lastOpenCodeError,
+      opencodeBinaryResolved: resolvedOpencodeBinary || null,
+      opencodeBinarySource: resolvedOpencodeBinarySource || null,
+      opencodeShimInterpreter: resolvedOpencodeBinary ? opencodeShimInterpreter(resolvedOpencodeBinary) : null,
+      nodeBinaryResolved: resolvedNodeBinary || null,
+      bunBinaryResolved: resolvedBunBinary || null,
     });
   });
 
@@ -3364,6 +4121,13 @@ async function main(options = {}) {
       res.flushHeaders();
     }
 
+    uiNotificationClients.add(res);
+    const cleanupClient = () => {
+      uiNotificationClients.delete(res);
+    };
+    req.on('close', cleanupClient);
+    req.on('error', cleanupClient);
+
     const heartbeatInterval = setInterval(() => {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
@@ -3378,17 +4142,19 @@ async function main(options = {}) {
 
 `);
       const payload = parseSseDataPayload(block);
-      void maybeSendPushForTrigger(payload);
-      const activity = deriveSessionActivity(payload);
-      if (activity) {
-        setSessionActivityPhase(activity.sessionId, activity.phase);
-        writeSseEvent(res, {
-          type: 'openchamber:session-activity',
-          properties: {
-            sessionId: activity.sessionId,
-            phase: activity.phase,
+      const transitions = deriveSessionActivityTransitions(payload);
+      if (transitions && transitions.length > 0) {
+        for (const activity of transitions) {
+          if (setSessionActivityPhase(activity.sessionId, activity.phase)) {
+            writeSseEvent(res, {
+              type: 'openchamber:session-activity',
+              properties: {
+                sessionId: activity.sessionId,
+                phase: activity.phase,
+              }
+            });
           }
-        });
+        }
       }
     };
 
@@ -3415,6 +4181,7 @@ async function main(options = {}) {
       }
     } finally {
       clearInterval(heartbeatInterval);
+      cleanupClient();
       cleanup();
       try {
         res.end();
@@ -3499,17 +4266,19 @@ async function main(options = {}) {
 
 `);
       const payload = parseSseDataPayload(block);
-      void maybeSendPushForTrigger(payload);
-      const activity = deriveSessionActivity(payload);
-      if (activity) {
-        setSessionActivityPhase(activity.sessionId, activity.phase);
-        writeSseEvent(res, {
-          type: 'openchamber:session-activity',
-          properties: {
-            sessionId: activity.sessionId,
-            phase: activity.phase,
+      const transitions = deriveSessionActivityTransitions(payload);
+      if (transitions && transitions.length > 0) {
+        for (const activity of transitions) {
+          if (setSessionActivityPhase(activity.sessionId, activity.phase)) {
+            writeSseEvent(res, {
+              type: 'openchamber:session-activity',
+              properties: {
+                sessionId: activity.sessionId,
+                phase: activity.phase,
+              }
+            });
           }
-        });
+        }
       }
     };
 
@@ -3552,6 +4321,50 @@ async function main(options = {}) {
     } catch (error) {
       console.error('Failed to load settings:', error);
       res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load settings' });
+    }
+  });
+
+  app.get('/api/config/opencode-resolution', async (_req, res) => {
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const configured = typeof settings?.opencodeBinary === 'string' ? settings.opencodeBinary : null;
+
+      const previousSource = resolvedOpencodeBinarySource;
+      const detectedNow = resolveOpencodeCliPath();
+      const rawDetectedSourceNow = resolvedOpencodeBinarySource;
+      resolvedOpencodeBinarySource = previousSource;
+
+      // Best-effort: apply configured override (if any) and resolve.
+      await applyOpencodeBinaryFromSettings();
+      ensureOpencodeCliEnv();
+
+      const resolved = resolvedOpencodeBinary || null;
+      const source = resolvedOpencodeBinarySource || null;
+      const detectedSourceNow =
+        detectedNow &&
+        resolved &&
+        detectedNow === resolved &&
+        rawDetectedSourceNow === 'env' &&
+        source &&
+        source !== 'env'
+          ? source
+          : rawDetectedSourceNow;
+      const shim = resolved ? opencodeShimInterpreter(resolved) : null;
+
+      res.json({
+        configured,
+        resolved,
+        resolvedDir: resolved ? path.dirname(resolved) : null,
+        source,
+        detectedNow,
+        detectedSourceNow,
+        shim,
+        node: resolvedNodeBinary || null,
+        bun: resolvedBunBinary || null,
+      });
+    } catch (error) {
+      console.error('Failed to build opencode resolution snapshot:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to build snapshot' });
     }
   });
 
@@ -7489,7 +8302,14 @@ Context:
     scheduleOpenCodeApiDetection();
   }
 
-  const distPath = path.join(__dirname, '..', 'dist');
+  const distPath = (() => {
+    const env = typeof process.env.OPENCHAMBER_DIST_DIR === 'string' ? process.env.OPENCHAMBER_DIST_DIR.trim() : '';
+    if (env) {
+      return path.resolve(env);
+    }
+    return path.join(__dirname, '..', 'dist');
+  })();
+
     if (fs.existsSync(distPath)) {
       console.log(`Serving static files from ${distPath}`);
       app.use(express.static(distPath, {
@@ -7513,13 +8333,17 @@ Context:
 
   let activePort = port;
 
+  const bindHost = typeof process.env.OPENCHAMBER_HOST === 'string' && process.env.OPENCHAMBER_HOST.trim().length > 0
+    ? process.env.OPENCHAMBER_HOST.trim()
+    : null;
+
   await new Promise((resolve, reject) => {
     const onError = (error) => {
       server.off('error', onError);
       reject(error);
     };
     server.once('error', onError);
-    server.listen(port, async () => {
+    const onListening = async () => {
       server.off('error', onError);
       const addressInfo = server.address();
       activePort = typeof addressInfo === 'object' && addressInfo ? addressInfo.port : port;
@@ -7556,7 +8380,13 @@ Context:
       }
 
       resolve();
-    });
+    };
+
+    if (bindHost) {
+      server.listen(port, bindHost, onListening);
+    } else {
+      server.listen(port, onListening);
+    }
   });
 
   if (attachSignals && !signalsAttached) {

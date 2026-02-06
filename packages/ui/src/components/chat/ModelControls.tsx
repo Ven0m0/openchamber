@@ -38,7 +38,8 @@ import { ProviderLogo } from '@/components/ui/ProviderLogo';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { useIsDesktopRuntime, useIsVSCodeRuntime } from '@/hooks/useRuntimeAPIs';
+import { useIsVSCodeRuntime } from '@/hooks/useRuntimeAPIs';
+import { isDesktopShell } from '@/lib/desktop';
 import { getAgentColor } from '@/lib/agentColors';
 import { useDeviceInfo } from '@/lib/device';
 import { getEditModeColors } from '@/lib/permissions/editModeColors';
@@ -256,6 +257,7 @@ interface ModelControlsProps {
     mobilePanel?: MobileControlsPanel;
     onMobilePanelChange?: (panel: MobileControlsPanel) => void;
     onMobilePanelSelection?: () => void;
+    onAgentPanelSelection?: () => void;
 }
 
 export const ModelControls: React.FC<ModelControlsProps> = ({
@@ -263,6 +265,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     mobilePanel,
     onMobilePanelChange,
     onMobilePanelSelection,
+    onAgentPanelSelection,
 }) => {
     const {
         providers,
@@ -344,7 +347,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     const { favoriteModelsList, recentModelsList } = useModelLists();
 
     const { isMobile } = useDeviceInfo();
-    const isDesktopRuntime = useIsDesktopRuntime();
+    const isDesktop = React.useMemo(() => isDesktopShell(), []);
     const isVSCodeRuntime = useIsVSCodeRuntime();
     // Only use mobile panels on actual mobile devices, VSCode uses desktop dropdowns
     const isCompact = isMobile;
@@ -1032,9 +1035,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             }
             if (isCompact) {
                 closeMobilePanel();
-                if (onMobilePanelSelection) {
+                const callback = onAgentPanelSelection || onMobilePanelSelection;
+                if (callback) {
                     requestAnimationFrame(() => {
-                        onMobilePanelSelection();
+                        callback();
                     });
                 }
             }
@@ -1739,6 +1743,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 className={cn(
                                     'flex w-full flex-col gap-1 rounded-xl border px-2 py-1.5 text-left',
                                     'focus:outline-none focus-visible:ring-1 focus-visible:ring-primary agent-list-item',
+                                    'touch-manipulation cursor-pointer',
                                     agentColor.class,
                                     isSelected ? 'active' : 'border-border/40'
                                 )}
@@ -2401,7 +2406,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                         'model-controls__variant-label',
                                         controlTextSize,
                                         'font-medium min-w-0 truncate',
-                                        isDesktopRuntime ? 'max-w-[180px]' : undefined,
+                                        isDesktop ? 'max-w-[180px]' : undefined,
                                         colorClass,
                                     )}
                                 >
@@ -2469,7 +2474,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                 'model-controls__agent-label',
                                                 controlTextSize,
                                                 'font-medium min-w-0 truncate',
-                                                isDesktopRuntime ? 'max-w-[220px]' : undefined
+                                                isDesktop ? 'max-w-[220px]' : undefined
                                             )}
                                             style={uiAgentName ? { color: `var(${getAgentColor(uiAgentName).var})` } : undefined}
                                         >

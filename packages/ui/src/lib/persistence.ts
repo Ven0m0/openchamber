@@ -1,4 +1,3 @@
-import { getDesktopSettings, updateDesktopSettings as updateDesktopSettingsApi, isDesktopRuntime } from '@/lib/desktop';
 import type { DesktopSettings } from '@/lib/desktop';
 import { useUIStore } from '@/stores/useUIStore';
 import { useMessageQueueStore } from '@/stores/messageQueueStore';
@@ -48,6 +47,18 @@ const persistToLocalStorage = (settings: DesktopSettings) => {
     localStorage.setItem('pinnedDirectories', JSON.stringify(settings.pinnedDirectories));
   } else {
     localStorage.removeItem('pinnedDirectories');
+  }
+
+  if (Array.isArray(settings.projects) && settings.projects.length > 0) {
+    const collapsed = settings.projects
+      .filter((project) => (project as unknown as { sidebarCollapsed?: boolean }).sidebarCollapsed === true)
+      .map((project) => project.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (collapsed.length > 0) {
+      localStorage.setItem('oc.sessions.projectCollapse', JSON.stringify(collapsed));
+    } else {
+      localStorage.removeItem('oc.sessions.projectCollapse');
+    }
   }
   if (typeof settings.gitmojiEnabled === 'boolean') {
     localStorage.setItem('gitmojiEnabled', String(settings.gitmojiEnabled));
@@ -143,6 +154,9 @@ const sanitizeProjects = (value: unknown): DesktopSettings['projects'] | undefin
     ) {
       project.lastOpenedAt = candidate.lastOpenedAt;
     }
+    if (typeof candidate.sidebarCollapsed === 'boolean') {
+      (project as unknown as Record<string, unknown>).sidebarCollapsed = candidate.sidebarCollapsed;
+    }
     // Preserve worktreeDefaults
     if (candidate.worktreeDefaults && typeof candidate.worktreeDefaults === 'object') {
       const wt = candidate.worktreeDefaults as Record<string, unknown>;
@@ -162,6 +176,30 @@ const sanitizeProjects = (value: unknown): DesktopSettings['projects'] | undefin
   }
 
   return result.length > 0 ? result : undefined;
+};
+
+const sanitizeModelRefs = (value: unknown, limit: number): Array<{ providerID: string; modelID: string }> | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const result: Array<{ providerID: string; modelID: string }> = [];
+  const seen = new Set<string>();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const candidate = entry as Record<string, unknown>;
+    const providerID = typeof candidate.providerID === 'string' ? candidate.providerID.trim() : '';
+    const modelID = typeof candidate.modelID === 'string' ? candidate.modelID.trim() : '';
+    if (!providerID || !modelID) continue;
+    const key = `${providerID}/${modelID}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ providerID, modelID });
+    if (result.length >= limit) break;
+  }
+
+  return result;
 };
 
 const getPersistApi = (): PersistApi | undefined => {
@@ -228,6 +266,9 @@ const applyDesktopUiPreferences = (settings: DesktopSettings) => {
   if (typeof settings.fontSize === 'number' && Number.isFinite(settings.fontSize) && settings.fontSize !== store.fontSize) {
     store.setFontSize(settings.fontSize);
   }
+  if (typeof settings.terminalFontSize === 'number' && Number.isFinite(settings.terminalFontSize) && settings.terminalFontSize !== store.terminalFontSize) {
+    store.setTerminalFontSize(settings.terminalFontSize);
+  }
   if (typeof settings.padding === 'number' && Number.isFinite(settings.padding) && settings.padding !== store.padding) {
     store.setPadding(settings.padding);
   }
@@ -236,6 +277,28 @@ const applyDesktopUiPreferences = (settings: DesktopSettings) => {
   }
   if (typeof settings.inputBarOffset === 'number' && Number.isFinite(settings.inputBarOffset) && settings.inputBarOffset !== store.inputBarOffset) {
     store.setInputBarOffset(settings.inputBarOffset);
+  }
+
+  if (Array.isArray(settings.favoriteModels)) {
+    const current = store.favoriteModels;
+    const next = settings.favoriteModels;
+    const same =
+      current.length === next.length &&
+      current.every((item, idx) => item.providerID === next[idx]?.providerID && item.modelID === next[idx]?.modelID);
+    if (!same) {
+      useUIStore.setState({ favoriteModels: next });
+    }
+  }
+
+  if (Array.isArray(settings.recentModels)) {
+    const current = store.recentModels;
+    const next = settings.recentModels;
+    const same =
+      current.length === next.length &&
+      current.every((item, idx) => item.providerID === next[idx]?.providerID && item.modelID === next[idx]?.modelID);
+    if (!same) {
+      useUIStore.setState({ recentModels: next });
+    }
   }
   if (typeof settings.diffLayoutPreference === 'string'
     && (settings.diffLayoutPreference === 'dynamic' || settings.diffLayoutPreference === 'inline' || settings.diffLayoutPreference === 'side-by-side')) {
@@ -285,6 +348,11 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
   }
   if (typeof candidate.homeDirectory === 'string' && candidate.homeDirectory.length > 0) {
     result.homeDirectory = candidate.homeDirectory;
+  }
+
+  if (typeof candidate.opencodeBinary === 'string') {
+    const trimmed = candidate.opencodeBinary.trim();
+    result.opencodeBinary = trimmed.length > 0 ? trimmed : undefined;
   }
 
   const projects = sanitizeProjects(candidate.projects);
@@ -376,6 +444,9 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
   if (typeof candidate.fontSize === 'number' && Number.isFinite(candidate.fontSize)) {
     result.fontSize = candidate.fontSize;
   }
+  if (typeof candidate.terminalFontSize === 'number' && Number.isFinite(candidate.terminalFontSize)) {
+    result.terminalFontSize = candidate.terminalFontSize;
+  }
   if (typeof candidate.padding === 'number' && Number.isFinite(candidate.padding)) {
     result.padding = candidate.padding;
   }
@@ -384,6 +455,16 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
   }
   if (typeof candidate.inputBarOffset === 'number' && Number.isFinite(candidate.inputBarOffset)) {
     result.inputBarOffset = candidate.inputBarOffset;
+  }
+
+  const favoriteModels = sanitizeModelRefs(candidate.favoriteModels, 64);
+  if (favoriteModels) {
+    result.favoriteModels = favoriteModels;
+  }
+
+  const recentModels = sanitizeModelRefs(candidate.recentModels, 16);
+  if (recentModels) {
+    result.recentModels = recentModels;
   }
   if (
     typeof candidate.diffLayoutPreference === 'string'
@@ -481,9 +562,9 @@ export const syncDesktopSettings = async (): Promise<void> => {
   };
 
   try {
-    const settings = isDesktopRuntime() ? await getDesktopSettings() : await fetchWebSettings();
-    if (settings) {
-      applySettings(settings);
+    const webSettings = await fetchWebSettings();
+    if (webSettings) {
+      applySettings(webSettings);
     }
   } catch (error) {
     console.warn('Failed to synchronise settings:', error);
@@ -495,18 +576,7 @@ export const updateDesktopSettings = async (changes: Partial<DesktopSettings>): 
     return;
   }
 
-  if (isDesktopRuntime()) {
-    try {
-      const updated = await updateDesktopSettingsApi(changes);
-      if (updated) {
-        persistToLocalStorage(updated);
-        applyDesktopUiPreferences(updated);
-      }
-    } catch (error) {
-      console.warn('Failed to update desktop settings:', error);
-    }
-    return;
-  }
+  // Desktop shell uses the same HTTP settings API as web.
 
   const runtimeSettings = getRuntimeSettingsAPI();
   if (runtimeSettings) {

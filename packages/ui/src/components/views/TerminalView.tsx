@@ -17,9 +17,6 @@ import { useUIStore } from '@/stores/useUIStore';
 import { Button } from '@/components/ui/button';
 import { useDeviceInfo } from '@/lib/device';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
-import { isDesktopRuntime, isWebRuntime } from '@/lib/desktop';
-
-const TERMINAL_FONT_SIZE = 13;
 
 type Modifier = 'ctrl' | 'cmd';
 type MobileKey =
@@ -76,11 +73,13 @@ const getSequenceForKey = (key: MobileKey, modifier: Modifier | null): string | 
 };
 
 export const TerminalView: React.FC = () => {
-    const { terminal } = useRuntimeAPIs();
+    const { terminal, runtime } = useRuntimeAPIs();
     const { currentTheme } = useThemeSystem();
     const { monoFont } = useFontPreferences();
+    const terminalFontSize = useUIStore(state => state.terminalFontSize);
     const { isMobile, hasTouchInput } = useDeviceInfo();
-    const enableTabs = !isMobile && (isWebRuntime() || isDesktopRuntime());
+    // Tabs are supported for web + desktop runtimes (not VSCode).
+    const enableTabs = !isMobile && runtime.platform !== 'vscode';
     const showTerminalQuickKeysOnDesktop = useUIStore((state) => state.showTerminalQuickKeysOnDesktop);
     const showQuickKeys = isMobile || showTerminalQuickKeysOnDesktop;
 
@@ -238,11 +237,6 @@ export const TerminalView: React.FC = () => {
 
                         switch (event.type) {
                             case 'connected': {
-                                if (event.runtime || event.ptyBackend) {
-                                    console.log(
-                                        `[Terminal] connected runtime=${event.runtime ?? 'unknown'} pty=${event.ptyBackend ?? 'unknown'}`
-                                    );
-                                }
                                 setConnecting(directory, tabId, false);
                                 setConnectionError(null);
                                 setIsFatalError(false);
@@ -973,7 +967,7 @@ export const TerminalView: React.FC = () => {
                                 onResize={handleViewportResize}
                                 theme={xtermTheme}
                                 fontFamily={resolvedFontStack}
-                                fontSize={TERMINAL_FONT_SIZE}
+                                fontSize={terminalFontSize}
                                 enableTouchScroll={hasTouchInput}
                             />
                         ) : (
@@ -989,7 +983,7 @@ export const TerminalView: React.FC = () => {
                                     onResize={handleViewportResize}
                                     theme={xtermTheme}
                                     fontFamily={resolvedFontStack}
-                                    fontSize={TERMINAL_FONT_SIZE}
+                                    fontSize={terminalFontSize}
                                     enableTouchScroll={hasTouchInput}
                                 />
                             </ScrollableOverlay>

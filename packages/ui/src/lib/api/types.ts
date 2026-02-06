@@ -378,6 +378,7 @@ export interface ProjectEntry {
   addedAt?: number;
   lastOpenedAt?: number;
   worktreeDefaults?: WorktreeDefaults;
+  sidebarCollapsed?: boolean;
 }
 
 export interface SettingsPayload {
@@ -388,6 +389,7 @@ export interface SettingsPayload {
   darkThemeId?: string;
   lastDirectory?: string;
   homeDirectory?: string;
+  opencodeBinary?: string;
   projects?: ProjectEntry[];
   activeProjectId?: string;
   approvedDirectories?: string[];
@@ -403,6 +405,7 @@ export interface SettingsPayload {
   gitmojiEnabled?: boolean;
   toolCallExpansion?: 'collapsed' | 'activity' | 'detailed';
   fontSize?: number;
+  terminalFontSize?: number;
   padding?: number;
   cornerRadius?: number;
   inputBarOffset?: number;
