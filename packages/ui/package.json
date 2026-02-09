@@ -1,6 +1,6 @@
 {
   "name": "@openchamber/ui",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "private": true,
   "type": "module",
   "main": "src/main.tsx",
@@ -56,6 +56,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
+    "codemirror-lang-elixir": "^4.0.0",
     "express": "^5.1.0",
     "fuse.js": "^7.1.0",
     "ghostty-web": "^0.4.0",

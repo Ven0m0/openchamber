@@ -5,11 +5,13 @@ import {
   RiArrowDownSLine,
   RiLoader4Line,
   RiGitBranchLine,
+  RiGitRepositoryLine,
   RiBriefcaseLine,
   RiHomeLine,
   RiGraduationCapLine,
   RiCodeLine,
   RiHeartLine,
+  RiHistoryLine,
   RiUser3Line,
 } from '@remixicon/react';
 import { Button } from '@/components/ui/button';
@@ -23,7 +25,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { BranchSelector } from './BranchSelector';
 import { WorktreeBranchDisplay } from './WorktreeBranchDisplay';
 import { SyncActions } from './SyncActions';
-import type { GitStatus, GitIdentityProfile } from '@/lib/api/types';
+import type { GitStatus, GitIdentityProfile, GitRemote } from '@/lib/api/types';
 
 type SyncAction = 'fetch' | 'pull' | 'push' | null;
 
@@ -33,9 +35,10 @@ interface GitHeaderProps {
   remoteBranches: string[];
   branchInfo: Record<string, { ahead?: number; behind?: number }> | undefined;
   syncAction: SyncAction;
-  onFetch: () => void;
-  onPull: () => void;
-  onPush: () => void;
+  remotes: GitRemote[];
+  onFetch: (remote: GitRemote) => void;
+  onPull: (remote: GitRemote) => void;
+  onPush: (remote: GitRemote) => void;
   onCheckoutBranch: (branch: string) => void;
   onCreateBranch: (name: string) => Promise<void>;
   onRenameBranch?: (oldName: string, newName: string) => Promise<void>;
@@ -44,6 +47,8 @@ interface GitHeaderProps {
   onSelectIdentity: (profile: GitIdentityProfile) => void;
   isApplyingIdentity: boolean;
   isWorktreeMode: boolean;
+  onOpenHistory?: () => void;
+  onOpenBranchPicker?: () => void;
 }
 
 const IDENTITY_ICON_MAP: Record<
@@ -184,6 +189,7 @@ export const GitHeader: React.FC<GitHeaderProps> = ({
   remoteBranches,
   branchInfo,
   syncAction,
+  remotes,
   onFetch,
   onPull,
   onPush,
@@ -195,6 +201,8 @@ export const GitHeader: React.FC<GitHeaderProps> = ({
   onSelectIdentity,
   isApplyingIdentity,
   isWorktreeMode,
+  onOpenHistory,
+  onOpenBranchPicker,
 }) => {
   if (!status) {
     return null;
@@ -244,6 +252,7 @@ export const GitHeader: React.FC<GitHeaderProps> = ({
 
       <SyncActions
         syncAction={syncAction}
+        remotes={remotes}
         onFetch={onFetch}
         onPull={onPull}
         onPush={onPush}
@@ -251,6 +260,40 @@ export const GitHeader: React.FC<GitHeaderProps> = ({
       />
 
       <div className="flex-1" />
+
+      {onOpenBranchPicker ? (
+        <Tooltip delayDuration={1000}>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="gap-1.5 px-2 py-1 h-8 typography-ui-label"
+              onClick={onOpenBranchPicker}
+            >
+              <RiGitRepositoryLine className="size-4" />
+              <span className="hidden sm:inline">Manage branches</span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent sideOffset={8}>Manage branches</TooltipContent>
+        </Tooltip>
+      ) : null}
+
+      {onOpenHistory ? (
+        <Tooltip delayDuration={1000}>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="gap-1.5 px-2 py-1 h-8 typography-ui-label"
+              onClick={onOpenHistory}
+            >
+              <RiHistoryLine className="size-4" />
+              <span className="hidden sm:inline">History</span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent sideOffset={8}>Show commit history</TooltipContent>
+        </Tooltip>
+      ) : null}
 
       <IdentityDropdown
         activeProfile={activeIdentityProfile}
