@@ -594,13 +594,30 @@ export type GitHubCheckRun = {
     url?: string;
     name?: string;
     conclusion?: string | null;
-    steps?: Array<{ name: string; status?: string; conclusion?: string | null; number?: number }>;
+    steps?: Array<{
+      name: string;
+      status?: string;
+      conclusion?: string | null;
+      number?: number;
+      startedAt?: string;
+      completedAt?: string;
+    }>;
   };
+  annotations?: Array<{
+    path?: string;
+    startLine?: number;
+    endLine?: number;
+    level?: string;
+    message: string;
+    title?: string;
+    rawDetails?: string;
+  }>;
 };
 
 export type GitHubPullRequest = {
   number: number;
   title: string;
+  body?: string;
   url: string;
   state: 'open' | 'closed' | 'merged';
   draft: boolean;
@@ -684,6 +701,17 @@ export type GitHubPullRequestCreateInput = {
   base: string;
   body?: string;
   draft?: boolean;
+  /** Remote to create the PR against (target repo, e.g., 'upstream' for forks) */
+  remote?: string;
+  /** Remote where the head branch lives (source repo, e.g., 'origin' for forks) */
+  headRemote?: string;
+};
+
+export type GitHubPullRequestUpdateInput = {
+  directory: string;
+  number: number;
+  title: string;
+  body?: string;
 };
 
 export type GitHubPullRequestMergeInput = {
@@ -792,8 +820,9 @@ export interface GitHubAPI {
   authActivate(accountId: string): Promise<GitHubAuthStatus>;
   me?(): Promise<GitHubUserSummary>;
 
-  prStatus(directory: string, branch: string): Promise<GitHubPullRequestStatus>;
+  prStatus(directory: string, branch: string, remote?: string): Promise<GitHubPullRequestStatus>;
   prCreate(payload: GitHubPullRequestCreateInput): Promise<GitHubPullRequest>;
+  prUpdate(payload: GitHubPullRequestUpdateInput): Promise<GitHubPullRequest>;
   prMerge(payload: GitHubPullRequestMergeInput): Promise<GitHubPullRequestMergeResult>;
   prReady(payload: GitHubPullRequestReadyInput): Promise<GitHubPullRequestReadyResult>;
 

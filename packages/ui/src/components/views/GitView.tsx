@@ -15,6 +15,7 @@ import {
   useIsGitRepo,
 } from '@/stores/useGitStore';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
+import { ScrollShadow } from '@/components/ui/ScrollShadow';
 import {
   RiGitBranchLine,
   RiGitMergeLine,
@@ -47,9 +48,9 @@ import { useUIStore } from '@/stores/useUIStore';
 import { IntegrateCommitsSection } from './git/IntegrateCommitsSection';
 
 import { GitHeader } from './git/GitHeader';
-import { GitEmptyState } from './git/GitEmptyState';
 import { ChangesSection } from './git/ChangesSection';
 import { CommitSection } from './git/CommitSection';
+import { GitEmptyState } from './git/GitEmptyState';
 import { HistorySection } from './git/HistorySection';
 import { PullRequestSection } from './git/PullRequestSection';
 import { ConflictDialog } from './git/ConflictDialog';
@@ -59,11 +60,17 @@ import { BranchIntegrationSection, type OperationLogEntry } from './git/BranchIn
 import type { GitRemote } from '@/lib/gitApi';
 import { BranchPickerDialog } from '@/components/session/BranchPickerDialog';
 import { getRootBranch } from '@/lib/worktrees/worktreeStatus';
+import { cn } from '@/lib/utils';
 
 type SyncAction = 'fetch' | 'pull' | 'push' | null;
 type CommitAction = 'commit' | 'commitAndPush' | null;
 type BranchOperation = 'merge' | 'rebase' | null;
 type ActionTab = 'commit' | 'branch' | 'pr' | 'worktree';
+
+const GIT_ACTION_TAB_STORAGE_KEY = 'oc.git.actionTab';
+
+const isActionTab = (value: unknown): value is ActionTab =>
+  value === 'commit' || value === 'branch' || value === 'pr' || value === 'worktree';
 
 
 type GitViewSnapshot = {
@@ -206,7 +213,11 @@ const gitViewSnapshots = new Map<string, GitViewSnapshot>();
 const normalizePath = (value?: string | null): string =>
   (value || '').replace(/\\/g, '/').replace(/\/+$/, '');
 
-export const GitView: React.FC = () => {
+interface GitViewProps {
+  mode?: 'full' | 'sidebar';
+}
+
+export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
   const { git } = useRuntimeAPIs();
   const currentDirectory = useEffectiveDirectory();
   const { currentSessionId, worktreeMetadata: worktreeMap } = useSessionStore();
@@ -294,11 +305,13 @@ export const GitView: React.FC = () => {
     initialSnapshot?.commitMessage ?? ''
   );
   const [isGitmojiPickerOpen, setIsGitmojiPickerOpen] = React.useState(false);
+  const actionPanelScrollRef = React.useRef<HTMLElement | null>(null);
   const [syncAction, setSyncAction] = React.useState<SyncAction>(null);
   const [commitAction, setCommitAction] = React.useState<CommitAction>(null);
   const [logMaxCountLocal, setLogMaxCountLocal] = React.useState<number>(25);
   const [isSettingIdentity, setIsSettingIdentity] = React.useState(false);
   const { triggerFireworks } = useFireworksCelebration();
+  const isSidebarMode = mode === 'sidebar';
 
   const autoAppliedDefaultRef = React.useRef<Map<string, string>>(new Map());
   const identityApplyCountRef = React.useRef(0);
@@ -325,6 +338,17 @@ export const GitView: React.FC = () => {
   const [generatedHighlights, setGeneratedHighlights] = React.useState<string[]>(
     initialSnapshot?.generatedHighlights ?? []
   );
+
+  const scrollActionPanelToBottom = React.useCallback(() => {
+    const scrollTarget = actionPanelScrollRef.current;
+    if (!scrollTarget) return;
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scrollTarget.scrollTo({ top: scrollTarget.scrollHeight, behavior: 'smooth' });
+      });
+    });
+  }, []);
 
   const repoRootForIntegrate = worktreeMetadata?.projectDirectory || null;
   const sourceBranchForIntegrate = status?.current || null;
@@ -372,13 +396,21 @@ export const GitView: React.FC = () => {
   const [gitmojiEmojis, setGitmojiEmojis] = React.useState<GitmojiEntry[]>([]);
   const [gitmojiSearch, setGitmojiSearch] = React.useState('');
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = React.useState(false);
-  const [actionTab, setActionTab] = React.useState<ActionTab>('commit');
+  const [actionTab, setActionTab] = React.useState<ActionTab>(() => {
+    if (typeof window === 'undefined') {
+      return 'commit';
+    }
+    const stored = window.localStorage.getItem(GIT_ACTION_TAB_STORAGE_KEY);
+    return isActionTab(stored) ? stored : 'commit';
+  });
   const [remotes, setRemotes] = React.useState<GitRemote[]>([]);
   const [branchOperation, setBranchOperation] = React.useState<BranchOperation>(null);
   const [operationLogs, setOperationLogs] = React.useState<OperationLogEntry[]>([]);
   const [conflictDialogOpen, setConflictDialogOpen] = React.useState(false);
   const [conflictFiles, setConflictFiles] = React.useState<string[]>([]);
   const [conflictOperation, setConflictOperation] = React.useState<'merge' | 'rebase'>('merge');
+  const [pushRemoteDialogOpen, setPushRemoteDialogOpen] = React.useState(false);
+  const [pendingPushAction, setPendingPushAction] = React.useState<'commitAndPush' | null>(null);
 
   // Conflict state persistence key
   const conflictStorageKey = React.useMemo(() => {
@@ -402,6 +434,13 @@ export const GitView: React.FC = () => {
     if (!conflictStorageKey || typeof window === 'undefined') return;
     window.localStorage.removeItem(conflictStorageKey);
   }, [conflictStorageKey]);
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    window.localStorage.setItem(GIT_ACTION_TAB_STORAGE_KEY, actionTab);
+  }, [actionTab]);
 
   // Restore conflict state from localStorage on mount
   React.useEffect(() => {
@@ -719,7 +758,7 @@ export const GitView: React.FC = () => {
     }
   };
 
-  const handleCommit = async (options: { pushAfter?: boolean } = {}) => {
+  const handleCommit = async (options: { pushAfter?: boolean; remote?: GitRemote } = {}) => {
     if (!currentDirectory) return;
     if (!commitMessage.trim()) {
       toast.error('Please enter a commit message');
@@ -731,6 +770,17 @@ export const GitView: React.FC = () => {
       toast.error('Select at least one file to commit');
       return;
     }
+
+    // If pushing with multiple remotes and no remote specified, this shouldn't happen anymore
+    // since CommitSection now uses a dropdown. But keep as fallback for safety.
+    if (options.pushAfter && remotes.length > 1 && !options.remote) {
+      setPendingPushAction('commitAndPush');
+      setPushRemoteDialogOpen(true);
+      return;
+    }
+
+    // If there's only one remote, use it automatically when no remote is specified
+    const targetRemote = options.remote ?? (remotes.length === 1 ? remotes[0] : undefined);
 
     const action: CommitAction = options.pushAfter ? 'commitAndPush' : 'commit';
     setCommitAction(action);
@@ -748,8 +798,9 @@ export const GitView: React.FC = () => {
       await refreshStatusAndBranches();
 
       if (options.pushAfter) {
-        await git.gitPush(currentDirectory);
-        toast.success('Pushed to remote');
+        const remoteName = targetRemote?.name;
+        await git.gitPush(currentDirectory, remoteName ? { remote: remoteName } : undefined);
+        toast.success(remoteName ? `Pushed to ${remoteName}` : 'Pushed to remote');
         triggerFireworks();
         await refreshStatusAndBranches(false);
       } else {
@@ -764,6 +815,19 @@ export const GitView: React.FC = () => {
     } finally {
       setCommitAction(null);
     }
+  };
+
+  const handlePushRemoteSelect = (remote: GitRemote) => {
+    setPushRemoteDialogOpen(false);
+    if (pendingPushAction === 'commitAndPush') {
+      handleCommit({ pushAfter: true, remote });
+    }
+    setPendingPushAction(null);
+  };
+
+  const handlePushRemoteDialogClose = () => {
+    setPushRemoteDialogOpen(false);
+    setPendingPushAction(null);
   };
 
   const handleGenerateCommitMessage = React.useCallback(async () => {
@@ -797,7 +861,7 @@ export const GitView: React.FC = () => {
       }
       setGeneratedHighlights(highlights);
 
-      toast.success('Commit message generated');
+      scrollActionPanelToBottom();
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Failed to generate commit message';
@@ -805,21 +869,24 @@ export const GitView: React.FC = () => {
     } finally {
       setIsGeneratingMessage(false);
     }
-  }, [currentDirectory, selectedPaths, git, settingsGitmojiEnabled, gitmojiEmojis]);
+  }, [currentDirectory, selectedPaths, git, settingsGitmojiEnabled, gitmojiEmojis, scrollActionPanelToBottom]);
 
-  const handleCreateBranch = async (branchName: string) => {
+  const handleCreateBranch = async (branchName: string, remote?: GitRemote) => {
     if (!currentDirectory || !status) return;
     const checkoutBase = status.current ?? null;
+    const remoteName = remote?.name ?? 'origin';
 
     try {
       await git.createBranch(currentDirectory, branchName, checkoutBase ?? 'HEAD');
       toast.success(`Created branch ${branchName}`);
 
+      // Checkout the new branch and stay on it
+      await git.checkoutBranch(currentDirectory, branchName);
+
       let pushSucceeded = false;
       try {
-        await git.checkoutBranch(currentDirectory, branchName);
         await git.gitPush(currentDirectory, {
-          remote: 'origin',
+          remote: remoteName,
           branch: branchName,
           options: ['--set-upstream'],
         });
@@ -828,7 +895,7 @@ export const GitView: React.FC = () => {
         const message =
           pushError instanceof Error
             ? pushError.message
-            : 'Unable to push new branch to origin.';
+            : `Unable to push new branch to ${remoteName}.`;
         toast.warning('Branch created locally', {
           description: (
             <span className="text-foreground/80 dark:text-foreground/70">
@@ -836,21 +903,13 @@ export const GitView: React.FC = () => {
             </span>
           ),
         });
-      } finally {
-        if (checkoutBase) {
-          try {
-            await git.checkoutBranch(currentDirectory, checkoutBase);
-          } catch (restoreError) {
-            console.warn('Failed to restore original branch after creation:', restoreError);
-          }
-        }
       }
 
       await refreshStatusAndBranches();
       await refreshLog();
 
       if (pushSucceeded) {
-        toast.success(`Upstream set for ${branchName}`);
+        toast.success(`Upstream set for ${branchName} on ${remoteName}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to create branch';
@@ -1048,10 +1107,8 @@ export const GitView: React.FC = () => {
     return globalIdentity ?? null;
   }, [currentIdentity, profiles, globalIdentity]);
 
-  const uniqueChangeCount = changeEntries.length;
   const selectedCount = selectedPaths.size;
   const isBusy = isLoading || syncAction !== null || commitAction !== null;
-  const hasChanges = uniqueChangeCount > 0;
   const canShowIntegrateCommitsSection = Boolean(
     worktreeMetadata && repoRootForIntegrate && sourceBranchForIntegrate && shouldShowIntegrateCommits
   );
@@ -1561,6 +1618,7 @@ export const GitView: React.FC = () => {
         onSelectIdentity={handleApplyIdentity}
         isApplyingIdentity={isSettingIdentity}
         isWorktreeMode={!!worktreeMetadata}
+        isSidebarMode={isSidebarMode}
         onOpenHistory={() => setIsHistoryDialogOpen(true)}
         onOpenBranchPicker={branchPickerProject ? () => setIsBranchPickerOpen(true) : undefined}
       />
@@ -1582,47 +1640,17 @@ export const GitView: React.FC = () => {
         )}
 
       <div className="flex-1 min-h-0 overflow-hidden">
-        <div className="h-full min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(520px,1fr)_480px]">
-          <div className="min-w-0 min-h-0 h-full flex flex-col">
-            {hasChanges ? (
-              <ChangesSection
-                variant="plain"
-                changeEntries={changeEntries}
-                selectedPaths={selectedPaths}
-                diffStats={status?.diffStats}
-                revertingPaths={revertingPaths}
-                onToggleFile={toggleFileSelection}
-                onSelectAll={selectAll}
-                onClearSelection={clearSelection}
-                onViewDiff={(path) => useUIStore.getState().navigateToDiff(path)}
-                onRevertFile={handleRevertFile}
-              />
-            ) : (
-              <div className="flex-1 min-h-0 flex items-center justify-center px-6">
-                <GitEmptyState
-                  behind={status?.behind ?? 0}
-                  onPull={() => {
-                    if (effectiveRemotes.length > 0) {
-                      handleSyncAction('pull', effectiveRemotes[0]);
-                    } else {
-                      toast.error('No remotes configured');
-                    }
-                  }}
-                  isPulling={syncAction === 'pull'}
-                />
-              </div>
-            )}
-          </div>
-
-          <div className="min-w-0 min-h-0 h-full border-t xl:border-t-0 xl:border-l border-border/40 bg-muted/10 flex flex-col">
+        <div className="h-full min-h-0 flex flex-col">
+          <div className={cn('min-w-0 min-h-0 h-full bg-muted/10 flex flex-col', isSidebarMode && 'border-t border-border/40')}>
             <div className="px-3 py-3">
               <AnimatedTabs<ActionTab>
                 value={actionTab}
                 onValueChange={setActionTab}
                 collapseLabelsOnSmall
+                collapseLabelsOnNarrow={isSidebarMode}
                 tabs={[
                   { value: 'commit', label: 'Commit', icon: RiGitCommitLine },
-                  { value: 'branch', label: 'Update branch', icon: RiGitMergeLine },
+                  { value: 'branch', label: 'Update', icon: RiGitMergeLine },
                   { value: 'pr', label: 'PR', icon: RiGitPullRequestLine },
                   { value: 'worktree', label: 'Worktree', icon: RiSplitCellsHorizontal },
                 ]}
@@ -1631,29 +1659,64 @@ export const GitView: React.FC = () => {
             <div className="h-px bg-border/40" />
 
             <ScrollableOverlay
+              as={ScrollShadow}
+              ref={actionPanelScrollRef}
               outerClassName="flex-1 min-h-0"
               className="px-4 py-4"
               disableHorizontal
               preventOverscroll
             >
               {actionTab === 'commit' ? (
-                <CommitSection
-                  variant="plain"
-                  selectedCount={selectedCount}
-                  commitMessage={commitMessage}
-                  onCommitMessageChange={setCommitMessage}
-                  generatedHighlights={generatedHighlights}
-                  onInsertHighlights={handleInsertHighlights}
-                  onClearHighlights={clearGeneratedHighlights}
-                  onGenerateMessage={handleGenerateCommitMessage}
-                  isGeneratingMessage={isGeneratingMessage}
-                  onCommit={() => handleCommit({ pushAfter: false })}
-                  onCommitAndPush={() => handleCommit({ pushAfter: true })}
-                  commitAction={commitAction}
-                  isBusy={isBusy}
-                  gitmojiEnabled={settingsGitmojiEnabled}
-                  onOpenGitmojiPicker={() => setIsGitmojiPickerOpen(true)}
-                />
+                <div className="space-y-4">
+                  {(changeEntries?.length ?? 0) > 0 ? (
+                    <>
+                      <ChangesSection
+                        variant="plain"
+                        maxListHeightClassName="max-h-[40vh]"
+                        changeEntries={changeEntries}
+                        selectedPaths={selectedPaths}
+                        diffStats={status?.diffStats}
+                        revertingPaths={revertingPaths}
+                        onToggleFile={toggleFileSelection}
+                        onSelectAll={selectAll}
+                        onClearSelection={clearSelection}
+                        onViewDiff={(path) => useUIStore.getState().navigateToDiff(path)}
+                        onRevertFile={handleRevertFile}
+                      />
+
+                      <CommitSection
+                        variant="plain"
+                        selectedCount={selectedCount}
+                        commitMessage={commitMessage}
+                        onCommitMessageChange={setCommitMessage}
+                        generatedHighlights={generatedHighlights}
+                        onInsertHighlights={handleInsertHighlights}
+                        onClearHighlights={clearGeneratedHighlights}
+                        onGenerateMessage={handleGenerateCommitMessage}
+                        isGeneratingMessage={isGeneratingMessage}
+                        onCommit={() => handleCommit({ pushAfter: false })}
+                        onCommitAndPush={(remote) => handleCommit({ pushAfter: true, remote })}
+                        commitAction={commitAction}
+                        isBusy={isBusy}
+                        gitmojiEnabled={settingsGitmojiEnabled}
+                        onOpenGitmojiPicker={() => setIsGitmojiPickerOpen(true)}
+                        remotes={remotes}
+                      />
+                    </>
+                  ) : (
+                    <GitEmptyState
+                      behind={effectiveRemotes.length > 0 ? (status?.behind ?? 0) : 0}
+                      isPulling={syncAction === 'pull'}
+                      onPull={() => {
+                        const remote = effectiveRemotes[0];
+                        if (!remote) {
+                          return;
+                        }
+                        void handleSyncAction('pull', remote);
+                      }}
+                    />
+                  )}
+                </div>
               ) : null}
 
               {actionTab === 'branch' ? (
@@ -1711,6 +1774,8 @@ export const GitView: React.FC = () => {
                     directory={pullRequestProps.directory}
                     branch={pullRequestProps.branch}
                     baseBranch={baseBranch}
+                    remotes={remotes}
+                    onGeneratedDescription={scrollActionPanelToBottom}
                   />
                 ) : (
                   <div className="space-y-1">
@@ -1817,6 +1882,34 @@ export const GitView: React.FC = () => {
         onOpenChange={setIsBranchPickerOpen}
         project={branchPickerProject}
       />
+
+      <Dialog open={pushRemoteDialogOpen} onOpenChange={handlePushRemoteDialogClose}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Select remote</DialogTitle>
+            <DialogDescription>
+              Choose which remote to push to
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2">
+            {remotes.map((remote) => (
+              <button
+                key={remote.name}
+                type="button"
+                onClick={() => handlePushRemoteSelect(remote)}
+                className="flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg text-left border border-border/60 hover:bg-accent hover:border-border transition-colors"
+              >
+                <span className="typography-ui-label text-foreground font-medium">
+                  {remote.name}
+                </span>
+                <span className="typography-meta text-muted-foreground truncate max-w-full">
+                  {remote.pushUrl}
+                </span>
+              </button>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
 
     </div>
   );

@@ -16,6 +16,41 @@ export type EventStreamStatus =
   | 'offline'
   | 'error';
 
+const LEGACY_DEFAULT_NOTIFICATION_TEMPLATES = {
+  completion: { title: '{agent_name} is ready', message: '{last_message}' },
+  error: { title: 'Tool error', message: '{last_message}' },
+  question: { title: '{agent_name} needs input', message: '{last_message}' },
+  subtask: { title: 'Subtask complete', message: '{last_message}' },
+} as const;
+
+const EMPTY_NOTIFICATION_TEMPLATES = {
+  completion: { title: '', message: '' },
+  error: { title: '', message: '' },
+  question: { title: '', message: '' },
+  subtask: { title: '', message: '' },
+} as const;
+
+const isSameTemplateValue = (
+  a: { title: string; message: string } | undefined,
+  b: { title: string; message: string }
+) => {
+  if (!a) return false;
+  return a.title === b.title && a.message === b.message;
+};
+
+const isLegacyDefaultTemplates = (value: unknown): boolean => {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Record<string, { title: string; message: string } | undefined>;
+  return (
+    isSameTemplateValue(candidate.completion, LEGACY_DEFAULT_NOTIFICATION_TEMPLATES.completion)
+    && isSameTemplateValue(candidate.error, LEGACY_DEFAULT_NOTIFICATION_TEMPLATES.error)
+    && isSameTemplateValue(candidate.question, LEGACY_DEFAULT_NOTIFICATION_TEMPLATES.question)
+    && isSameTemplateValue(candidate.subtask, LEGACY_DEFAULT_NOTIFICATION_TEMPLATES.subtask)
+  );
+};
+
 interface UIStore {
 
   theme: 'light' | 'dark' | 'system';
@@ -24,6 +59,12 @@ interface UIStore {
   isSidebarOpen: boolean;
   sidebarWidth: number;
   hasManuallyResizedLeftSidebar: boolean;
+  isRightSidebarOpen: boolean;
+  rightSidebarWidth: number;
+  hasManuallyResizedRightSidebar: boolean;
+  isBottomTerminalOpen: boolean;
+  bottomTerminalHeight: number;
+  hasManuallyResizedBottomTerminal: boolean;
   isSessionSwitcherOpen: boolean;
   activeMainTab: MainTab;
   mainTabGuard: MainTabGuard | null;
@@ -73,6 +114,25 @@ interface UIStore {
   notificationMode: 'always' | 'hidden-only';
   notifyOnSubtasks: boolean;
 
+  // Event toggles (which events trigger notifications)
+  notifyOnCompletion: boolean;
+  notifyOnError: boolean;
+  notifyOnQuestion: boolean;
+
+  // Per-event notification templates
+  notificationTemplates: {
+    completion: { title: string; message: string };
+    error: { title: string; message: string };
+    question: { title: string; message: string };
+    subtask: { title: string; message: string };
+  };
+
+  // Summarization settings
+  summarizeLastMessage: boolean;
+  summaryThreshold: number;   // chars — messages longer than this get summarized
+  summaryLength: number;      // chars — target length for summary
+  maxLastMessageLength: number; // chars — truncate {last_message} when summarization is off
+
   showTerminalQuickKeysOnDesktop: boolean;
   persistChatDraft: boolean;
   isMobileSessionStatusBarCollapsed: boolean;
@@ -81,6 +141,12 @@ interface UIStore {
   toggleSidebar: () => void;
   setSidebarOpen: (open: boolean) => void;
   setSidebarWidth: (width: number) => void;
+  toggleRightSidebar: () => void;
+  setRightSidebarOpen: (open: boolean) => void;
+  setRightSidebarWidth: (width: number) => void;
+  toggleBottomTerminal: () => void;
+  setBottomTerminalOpen: (open: boolean) => void;
+  setBottomTerminalHeight: (height: number) => void;
   setSessionSwitcherOpen: (open: boolean) => void;
   setActiveMainTab: (tab: MainTab) => void;
   setMainTabGuard: (guard: MainTabGuard | null) => void;
@@ -135,6 +201,14 @@ interface UIStore {
   setNotificationMode: (mode: 'always' | 'hidden-only') => void;
   setShowTerminalQuickKeysOnDesktop: (value: boolean) => void;
   setNotifyOnSubtasks: (value: boolean) => void;
+  setNotifyOnCompletion: (value: boolean) => void;
+  setNotifyOnError: (value: boolean) => void;
+  setNotifyOnQuestion: (value: boolean) => void;
+  setNotificationTemplates: (templates: UIStore['notificationTemplates']) => void;
+  setSummarizeLastMessage: (value: boolean) => void;
+  setSummaryThreshold: (value: number) => void;
+  setSummaryLength: (value: number) => void;
+  setMaxLastMessageLength: (value: number) => void;
   setPersistChatDraft: (value: boolean) => void;
   setIsMobileSessionStatusBarCollapsed: (value: boolean) => void;
   openMultiRunLauncher: () => void;
@@ -153,6 +227,12 @@ export const useUIStore = create<UIStore>()(
         isSidebarOpen: true,
         sidebarWidth: 264,
         hasManuallyResizedLeftSidebar: false,
+        isRightSidebarOpen: false,
+        rightSidebarWidth: 420,
+        hasManuallyResizedRightSidebar: false,
+        isBottomTerminalOpen: false,
+        bottomTerminalHeight: 300,
+        hasManuallyResizedBottomTerminal: false,
         isSessionSwitcherOpen: false,
         activeMainTab: 'chat',
         mainTabGuard: null,
@@ -199,6 +279,23 @@ export const useUIStore = create<UIStore>()(
         notificationMode: 'hidden-only',
         notifyOnSubtasks: true,
 
+        // Event toggles (which events trigger notifications)
+        notifyOnCompletion: true,
+        notifyOnError: true,
+        notifyOnQuestion: true,
+        notificationTemplates: {
+          completion: { ...EMPTY_NOTIFICATION_TEMPLATES.completion },
+          error: { ...EMPTY_NOTIFICATION_TEMPLATES.error },
+          question: { ...EMPTY_NOTIFICATION_TEMPLATES.question },
+          subtask: { ...EMPTY_NOTIFICATION_TEMPLATES.subtask },
+        },
+
+        // Summarization settings
+        summarizeLastMessage: false,
+        summaryThreshold: 200,
+        summaryLength: 100,
+        maxLastMessageLength: 250,
+
         showTerminalQuickKeysOnDesktop: false,
         persistChatDraft: true,
         isMobileSessionStatusBarCollapsed: false,
@@ -241,6 +338,76 @@ export const useUIStore = create<UIStore>()(
 
         setSidebarWidth: (width) => {
           set({ sidebarWidth: width, hasManuallyResizedLeftSidebar: true });
+        },
+
+        toggleRightSidebar: () => {
+          set((state) => {
+            const newOpen = !state.isRightSidebarOpen;
+
+            if (newOpen && typeof window !== 'undefined') {
+              const proportionalWidth = Math.floor(window.innerWidth * 0.28);
+              return {
+                isRightSidebarOpen: newOpen,
+                rightSidebarWidth: proportionalWidth,
+                hasManuallyResizedRightSidebar: false,
+              };
+            }
+            return { isRightSidebarOpen: newOpen };
+          });
+        },
+
+        setRightSidebarOpen: (open) => {
+          set(() => {
+            if (open && typeof window !== 'undefined') {
+              const proportionalWidth = Math.floor(window.innerWidth * 0.28);
+              return {
+                isRightSidebarOpen: open,
+                rightSidebarWidth: proportionalWidth,
+                hasManuallyResizedRightSidebar: false,
+              };
+            }
+            return { isRightSidebarOpen: open };
+          });
+        },
+
+        setRightSidebarWidth: (width) => {
+          set({ rightSidebarWidth: width, hasManuallyResizedRightSidebar: true });
+        },
+
+        toggleBottomTerminal: () => {
+          set((state) => {
+            const newOpen = !state.isBottomTerminalOpen;
+
+            if (newOpen && typeof window !== 'undefined') {
+              const proportionalHeight = Math.floor(window.innerHeight * 0.32);
+              return {
+                isBottomTerminalOpen: newOpen,
+                bottomTerminalHeight: proportionalHeight,
+                hasManuallyResizedBottomTerminal: false,
+              };
+            }
+
+            return { isBottomTerminalOpen: newOpen };
+          });
+        },
+
+        setBottomTerminalOpen: (open) => {
+          set(() => {
+            if (open && typeof window !== 'undefined') {
+              const proportionalHeight = Math.floor(window.innerHeight * 0.32);
+              return {
+                isBottomTerminalOpen: open,
+                bottomTerminalHeight: proportionalHeight,
+                hasManuallyResizedBottomTerminal: false,
+              };
+            }
+
+            return { isBottomTerminalOpen: open };
+          });
+        },
+
+        setBottomTerminalHeight: (height) => {
+          set({ bottomTerminalHeight: height, hasManuallyResizedBottomTerminal: true });
         },
 
         setSessionSwitcherOpen: (open) => {
@@ -623,6 +790,14 @@ export const useUIStore = create<UIStore>()(
               updates.sidebarWidth = Math.floor(window.innerWidth * 0.2);
             }
 
+            if (state.isRightSidebarOpen && !state.hasManuallyResizedRightSidebar) {
+              updates.rightSidebarWidth = Math.floor(window.innerWidth * 0.28);
+            }
+
+            if (state.isBottomTerminalOpen && !state.hasManuallyResizedBottomTerminal) {
+              updates.bottomTerminalHeight = Math.floor(window.innerHeight * 0.32);
+            }
+
             return updates;
           });
         },
@@ -688,6 +863,14 @@ export const useUIStore = create<UIStore>()(
           set({ notifyOnSubtasks: value });
         },
 
+        setNotifyOnCompletion: (value) => { set({ notifyOnCompletion: value }); },
+        setNotifyOnError: (value) => { set({ notifyOnError: value }); },
+        setNotifyOnQuestion: (value) => { set({ notifyOnQuestion: value }); },
+        setNotificationTemplates: (templates) => { set({ notificationTemplates: templates }); },
+        setSummarizeLastMessage: (value) => { set({ summarizeLastMessage: value }); },
+        setSummaryThreshold: (value) => { set({ summaryThreshold: value }); },
+        setSummaryLength: (value) => { set({ summaryLength: value }); },
+        setMaxLastMessageLength: (value) => { set({ maxLastMessageLength: value }); },
         setPersistChatDraft: (value) => {
           set({ persistChatDraft: value });
         },
@@ -698,10 +881,33 @@ export const useUIStore = create<UIStore>()(
       {
         name: 'ui-store',
         storage: createJSONStorage(() => getSafeStorage()),
+        version: 1,
+        migrate: (persistedState, version) => {
+          if (version >= 1 || !persistedState || typeof persistedState !== 'object') {
+            return persistedState;
+          }
+          const state = persistedState as Record<string, unknown>;
+          if (!isLegacyDefaultTemplates(state.notificationTemplates)) {
+            return persistedState;
+          }
+          return {
+            ...state,
+            notificationTemplates: {
+              completion: { ...EMPTY_NOTIFICATION_TEMPLATES.completion },
+              error: { ...EMPTY_NOTIFICATION_TEMPLATES.error },
+              question: { ...EMPTY_NOTIFICATION_TEMPLATES.question },
+              subtask: { ...EMPTY_NOTIFICATION_TEMPLATES.subtask },
+            },
+          };
+        },
         partialize: (state) => ({
           theme: state.theme,
           isSidebarOpen: state.isSidebarOpen,
           sidebarWidth: state.sidebarWidth,
+          isRightSidebarOpen: state.isRightSidebarOpen,
+          rightSidebarWidth: state.rightSidebarWidth,
+          isBottomTerminalOpen: state.isBottomTerminalOpen,
+          bottomTerminalHeight: state.bottomTerminalHeight,
           isSessionSwitcherOpen: state.isSessionSwitcherOpen,
           activeMainTab: state.activeMainTab,
           sidebarSection: state.sidebarSection,
@@ -731,6 +937,14 @@ export const useUIStore = create<UIStore>()(
           notificationMode: state.notificationMode,
           showTerminalQuickKeysOnDesktop: state.showTerminalQuickKeysOnDesktop,
           notifyOnSubtasks: state.notifyOnSubtasks,
+          notifyOnCompletion: state.notifyOnCompletion,
+          notifyOnError: state.notifyOnError,
+          notifyOnQuestion: state.notifyOnQuestion,
+          notificationTemplates: state.notificationTemplates,
+          summarizeLastMessage: state.summarizeLastMessage,
+          summaryThreshold: state.summaryThreshold,
+          summaryLength: state.summaryLength,
+          maxLastMessageLength: state.maxLastMessageLength,
           persistChatDraft: state.persistChatDraft,
           isMobileSessionStatusBarCollapsed: state.isMobileSessionStatusBarCollapsed,
         })
