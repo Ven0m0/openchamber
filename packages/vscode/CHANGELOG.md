@@ -1,3 +1,9 @@
+## [1.6.7] - 2026-02-10
+
+- Added usage pace and prediction indicators in the header and settings to make quota usage trends easier to track (thanks to @gsxdsm).
+- Added confirmation dialogs for destructive delete/reset actions to reduce accidental mistakes in settings and management flows.
+- Improved reliability for message loading so sessions recover more predictably after reloads.
+
 ## [1.6.6] - 2026-02-9
 
 - Usage: added per-model quota groups in the header and fixed provider dropdown scrolling for easier usage tracking (thanks to @nelsonPires5, @gsxdsm).
