@@ -17,15 +17,14 @@ import {
   RiCloseCircleLine,
   RiCodeLine,
   RiCommandLine,
-  RiFolder6Line,
   RiGitBranchLine,
   RiLayoutLeftLine,
   RiPaletteLine,
   RiQuestionLine,
   RiSettings3Line,
-  RiTerminalBoxLine,
   RiText,
   RiTimeLine,
+  RiWindowLine,
 } from "@remixicon/react";
 import { getModifierLabel } from "@/lib/utils";
 
@@ -124,6 +123,11 @@ export const HelpDialog: React.FC = () => {
           description: "Cycle Thinking Variant",
           icon: RiBrainAi3Line,
         },
+        {
+          keys: [`Shift + Alt + ${mod} + N`],
+          description: "New Window (desktop only)",
+          icon: RiWindowLine,
+        },
       ],
     },
     {
@@ -159,21 +163,6 @@ export const HelpDialog: React.FC = () => {
           keys: [`${mod} + 2`],
           description: "Open Diff Panel",
           icon: RiCodeLine,
-        },
-        {
-          keys: [`${mod} + 3`],
-          description: "Open Files",
-          icon: RiFolder6Line,
-        },
-        {
-          keys: [`${mod} + 4`],
-          description: "Open Terminal",
-          icon: RiTerminalBoxLine,
-        },
-        {
-          keys: [`${mod} + 5`],
-          description: "Open Git Panel",
-          icon: RiGitBranchLine,
         },
         {
           keys: [`${mod} + T`],
