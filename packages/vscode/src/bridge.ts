@@ -67,6 +67,12 @@ type ApiProxyRequestPayload = {
   bodyBase64?: string;
 };
 
+type ApiSessionMessageRequestPayload = {
+  path?: string;
+  headers?: Record<string, string>;
+  bodyText?: string;
+};
+
 type ApiProxyResponsePayload = {
   status: number;
   headers: Record<string, string>;
@@ -760,6 +766,23 @@ const collectHeaders = (headers: Headers): Record<string, string> => {
   return result;
 };
 
+const buildUnavailableApiResponse = (): ApiProxyResponsePayload => {
+  const body = JSON.stringify({ error: 'OpenCode API unavailable' });
+  return {
+    status: 503,
+    headers: { 'content-type': 'application/json' },
+    bodyBase64: base64EncodeUtf8(body),
+  };
+};
+
+const sanitizeForwardHeaders = (input: Record<string, string> | undefined): Record<string, string> => {
+  const headers: Record<string, string> = { ...(input || {}) };
+  delete headers['content-length'];
+  delete headers['host'];
+  delete headers['connection'];
+  return headers;
+};
+
 export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeContext): Promise<BridgeResponse> {
   const { id, type, payload } = message;
 
@@ -768,12 +791,7 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
       case 'api:proxy': {
         const apiUrl = ctx?.manager?.getApiUrl();
         if (!apiUrl) {
-          const body = JSON.stringify({ error: 'OpenCode API unavailable' });
-          const data: ApiProxyResponsePayload = {
-            status: 503,
-            headers: { 'content-type': 'application/json' },
-            bodyBase64: base64EncodeUtf8(body),
-          };
+          const data = buildUnavailableApiResponse();
           return { id, type, success: true, data };
         }
 
@@ -788,7 +806,7 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
 
         const base = `${apiUrl.replace(/\/+$/, '')}/`;
         const targetUrl = new URL(normalizedPath.replace(/^\/+/, ''), base).toString();
-        const requestHeaders: Record<string, string> = { ...(headers || {}) };
+        const requestHeaders: Record<string, string> = sanitizeForwardHeaders(headers);
 
         // Ensure SSE requests are negotiated correctly.
         if (normalizedPath === '/event' || normalizedPath === '/global/event') {
@@ -823,6 +841,68 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           });
           const data: ApiProxyResponsePayload = {
             status: 502,
+            headers: { 'content-type': 'application/json' },
+            bodyBase64: base64EncodeUtf8(body),
+          };
+          return { id, type, success: true, data };
+        }
+      }
+
+      case 'api:session:message': {
+        const apiUrl = ctx?.manager?.getApiUrl();
+        if (!apiUrl) {
+          const data = buildUnavailableApiResponse();
+          return { id, type, success: true, data };
+        }
+
+        const { path: requestPath, headers, bodyText } = (payload || {}) as ApiSessionMessageRequestPayload;
+        const normalizedPath =
+          typeof requestPath === 'string' && requestPath.trim().length > 0
+            ? requestPath.trim().startsWith('/')
+              ? requestPath.trim()
+              : `/${requestPath.trim()}`
+            : '/';
+
+        if (!/^\/session\/[^/]+\/message(?:\?.*)?$/.test(normalizedPath)) {
+          const body = JSON.stringify({ error: 'Invalid session message proxy path' });
+          const data: ApiProxyResponsePayload = {
+            status: 400,
+            headers: { 'content-type': 'application/json' },
+            bodyBase64: base64EncodeUtf8(body),
+          };
+          return { id, type, success: true, data };
+        }
+
+        const base = `${apiUrl.replace(/\/+$/, '')}/`;
+        const targetUrl = new URL(normalizedPath.replace(/^\/+/, ''), base).toString();
+        const requestHeaders: Record<string, string> = sanitizeForwardHeaders(headers);
+
+        try {
+          const response = await fetch(targetUrl, {
+            method: 'POST',
+            headers: requestHeaders,
+            body: typeof bodyText === 'string' ? bodyText : '',
+            signal: AbortSignal.timeout(45000),
+          });
+
+          const arrayBuffer = await response.arrayBuffer();
+          const data: ApiProxyResponsePayload = {
+            status: response.status,
+            headers: collectHeaders(response.headers),
+            bodyBase64: Buffer.from(arrayBuffer).toString('base64'),
+          };
+
+          return { id, type, success: true, data };
+        } catch (error) {
+          const isTimeout =
+            error instanceof Error &&
+            ((error as Error & { name?: string }).name === 'TimeoutError' ||
+              (error as Error & { name?: string }).name === 'AbortError');
+          const body = JSON.stringify({
+            error: isTimeout ? 'OpenCode message forward timed out' : error instanceof Error ? error.message : 'OpenCode message forward failed',
+          });
+          const data: ApiProxyResponsePayload = {
+            status: isTimeout ? 504 : 503,
             headers: { 'content-type': 'application/json' },
             bodyBase64: base64EncodeUtf8(body),
           };
@@ -2202,12 +2282,61 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
       }
 
       case 'api:git/worktrees': {
+        const { directory, method } = (payload || {}) as {
+          directory?: string;
+          method?: string;
+          body?: unknown;
+          directoryPath?: string;
+          deleteLocalBranch?: boolean;
+        };
+        if (!directory) {
+          return { id, type, success: false, error: 'Directory is required' };
+        }
+
+        const normalizedMethod = typeof method === 'string' ? method.toUpperCase() : 'GET';
+
+        if (normalizedMethod === 'GET') {
+          const worktrees = await gitService.listGitWorktrees(directory);
+          return { id, type, success: true, data: worktrees };
+        }
+
+        if (normalizedMethod === 'POST') {
+          const created = await gitService.createWorktree(directory, (payload || {}) as gitService.CreateGitWorktreePayload);
+          return { id, type, success: true, data: created };
+        }
+
+        if (normalizedMethod === 'DELETE') {
+          const removePayload = payload as {
+            body?: { directory?: string; deleteLocalBranch?: boolean };
+            directory?: string;
+            deleteLocalBranch?: boolean;
+          };
+          const bodyDirectory = typeof removePayload?.body?.directory === 'string'
+            ? removePayload.body.directory
+            : '';
+          const legacyDirectory = typeof removePayload?.directory === 'string' ? removePayload.directory : '';
+          const worktreeDirectory = bodyDirectory || legacyDirectory || '';
+
+          if (!worktreeDirectory) {
+            return { id, type, success: false, error: 'Worktree directory is required' };
+          }
+          const removed = await gitService.removeWorktree(directory, {
+            directory: worktreeDirectory,
+            deleteLocalBranch: removePayload?.body?.deleteLocalBranch === true || removePayload?.deleteLocalBranch === true,
+          });
+          return { id, type, success: true, data: { success: Boolean(removed) } };
+        }
+
+        return { id, type, success: false, error: `Unsupported method: ${normalizedMethod}` };
+      }
+
+      case 'api:git/worktrees/validate': {
         const { directory } = (payload || {}) as { directory?: string };
         if (!directory) {
           return { id, type, success: false, error: 'Directory is required' };
         }
-        const worktrees = await gitService.listGitWorktrees(directory);
-        return { id, type, success: true, data: worktrees };
+        const result = await gitService.validateWorktreeCreate(directory, (payload || {}) as gitService.CreateGitWorktreePayload);
+        return { id, type, success: true, data: result };
       }
 
       case 'api:git/diff': {
@@ -2460,11 +2589,14 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
         const prompt = `You are drafting a GitHub Pull Request title + description. Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:\n- title: concise, sentence case, <= 80 chars, no trailing punctuation, no commit-style prefixes (no "feat:", "fix:")\n- body: GitHub-flavored markdown with these sections in this order: Summary, Testing, Notes\n- Summary: 3-6 bullet points describing user-visible changes; avoid internal helper function names\n- Testing: bullet list ("- Not tested" allowed)\n- Notes: bullet list; include breaking/rollout notes only when relevant\n\nContext:\n- base branch: ${base}\n- head branch: ${head}\n\nDiff summary:\n${diffSummaries}`;
 
         try {
+          const zenSettings = readSettings(ctx) as Record<string, unknown>;
+          const zenModelRaw = typeof zenSettings?.zenModel === 'string' ? (zenSettings.zenModel as string).trim() : '';
+          const zenModel = zenModelRaw.length > 0 ? zenModelRaw : 'gpt-5-nano';
           const response = await fetch('https://opencode.ai/zen/v1/responses', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              model: 'gpt-5-nano',
+              model: zenModel,
               input: [{ role: 'user', content: prompt }],
               max_output_tokens: 1200,
               stream: false,

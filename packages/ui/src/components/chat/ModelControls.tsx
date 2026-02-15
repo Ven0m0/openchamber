@@ -37,6 +37,7 @@ import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
 import { ProviderLogo } from '@/components/ui/ProviderLogo';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Switch } from '@/components/ui/switch';
+import { TextLoop } from '@/components/ui/TextLoop';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useIsVSCodeRuntime } from '@/hooks/useRuntimeAPIs';
 import { isDesktopShell } from '@/lib/desktop';
@@ -205,6 +206,28 @@ const formatCost = (value?: number | null) => {
     }
 
     return CURRENCY_FORMATTER.format(value);
+};
+
+const formatCompactPrice = (metadata?: ModelMetadata): string | null => {
+    if (!metadata?.cost) {
+        return null;
+    }
+
+    const inputCost = metadata.cost.input;
+    const outputCost = metadata.cost.output;
+    const hasInput = typeof inputCost === 'number' && Number.isFinite(inputCost);
+    const hasOutput = typeof outputCost === 'number' && Number.isFinite(outputCost);
+
+    if (hasInput && hasOutput) {
+        return `In ${formatCost(inputCost)} · Out ${formatCost(outputCost)}`;
+    }
+    if (hasInput) {
+        return `In ${formatCost(inputCost)}`;
+    }
+    if (hasOutput) {
+        return `Out ${formatCost(outputCost)}`;
+    }
+    return null;
 };
 
 const getCapabilityIcons = (metadata?: ModelMetadata) => {
@@ -441,8 +464,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             return sorted;
         }
         return sorted.filter((agent) =>
-            fuzzyMatch(agentSearchQuery, agent.name) ||
-            (agent.description && fuzzyMatch(agentSearchQuery, agent.description))
+            fuzzyMatch(agent.name, agentSearchQuery) ||
+            (agent.description && fuzzyMatch(agent.description, agentSearchQuery))
         );
     }, [selectableDesktopAgents, agentSearchQuery]);
 
@@ -518,13 +541,11 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     const inputModalityIcons = getModalityIcons(currentMetadata, 'input');
     const outputModalityIcons = getModalityIcons(currentMetadata, 'output');
 
+    // Providers/models can reload (directory switch/config sync) without changing
+    // currentProviderId/currentModelId; include providers to avoid stale variants.
     const availableVariants = React.useMemo(() => {
-        const variantKey = `${currentProviderId}/${currentModelId}`;
-        if (!variantKey) {
-            return [];
-        }
         return getCurrentModelVariants();
-    }, [getCurrentModelVariants, currentProviderId, currentModelId]);
+    }, [getCurrentModelVariants]);
     const hasVariants = availableVariants.length > 0;
 
     const costRows = [
@@ -1383,6 +1404,39 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         );
     };
 
+    const normalizeModelSearchValue = React.useCallback((value: string) => {
+        const lower = value.toLowerCase().trim();
+        const compact = lower.replace(/[^a-z0-9]/g, '');
+        const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
+        return { lower, compact, tokens };
+    }, []);
+
+    const matchesModelSearch = React.useCallback((candidate: string, query: string) => {
+        const normalizedQuery = normalizeModelSearchValue(query);
+        if (!normalizedQuery.lower) {
+            return true;
+        }
+
+        const normalizedCandidate = normalizeModelSearchValue(candidate);
+        if (normalizedCandidate.lower.includes(normalizedQuery.lower)) {
+            return true;
+        }
+
+        if (normalizedQuery.compact.length >= 2 && normalizedCandidate.compact.includes(normalizedQuery.compact)) {
+            return true;
+        }
+
+        if (normalizedQuery.tokens.length === 0) {
+            return false;
+        }
+
+        return normalizedQuery.tokens.every((queryToken) =>
+            normalizedCandidate.tokens.some((candidateToken) =>
+                candidateToken.startsWith(queryToken) || candidateToken.includes(queryToken)
+            )
+        );
+    }, [normalizeModelSearchValue]);
+
     const renderMobileModelPanel = () => {
         if (!isCompact) return null;
 
@@ -1392,13 +1446,13 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 const providerModels = Array.isArray(provider.models) ? provider.models : [];
                 const matchesProvider = normalizedQuery.length === 0
                     ? true
-                    : fuzzyMatch(provider.name, normalizedQuery) || fuzzyMatch(provider.id, normalizedQuery);
+                    : matchesModelSearch(provider.name, normalizedQuery) || matchesModelSearch(provider.id, normalizedQuery);
                 const matchingModels = normalizedQuery.length === 0
                     ? providerModels
                     : providerModels.filter((model: ProviderModel) => {
                         const name = getModelDisplayName(model);
                         const id = typeof model.id === 'string' ? model.id : '';
-                        return fuzzyMatch(name, normalizedQuery) || fuzzyMatch(id, normalizedQuery);
+                        return matchesModelSearch(name, normalizedQuery) || matchesModelSearch(id, normalizedQuery);
                     });
                 return { provider, providerModels: matchingModels, matchesProvider };
             })
@@ -1731,9 +1785,27 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 open={activeMobilePanel === 'agent'}
                 onClose={closeMobilePanel}
                 title="Select agent"
+                contentMaxHeightClassName="max-h-[min(52dvh,360px)]"
+                footer={(
+                    <div className="flex items-center justify-between">
+                        <span
+                            className={cn(
+                                'typography-meta font-medium',
+                                approveEditsDisabled ? 'text-muted-foreground' : 'text-foreground'
+                            )}
+                        >
+                            Auto-approve edits
+                        </span>
+                        <Switch
+                            checked={approveEditsChecked}
+                            disabled={approveEditsDisabled}
+                            onCheckedChange={handleApproveEditsToggle}
+                        />
+                    </div>
+                )}
             >
-                <div className="flex flex-col gap-1.5">
-                    {primaryAgents.map((agent) => {
+                <div className="flex flex-col gap-2">
+                    {selectableDesktopAgents.map((agent) => {
                         const isSelected = agent.name === uiAgentName;
                         const agentColor = getAgentColor(agent.name);
                         return (
@@ -1741,46 +1813,36 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 key={agent.name}
                                 type="button"
                                 className={cn(
-                                    'flex w-full flex-col gap-1 rounded-xl border px-2 py-1.5 text-left',
-                                    'focus:outline-none focus-visible:ring-1 focus-visible:ring-primary agent-list-item',
-                                    'touch-manipulation cursor-pointer',
-                                    agentColor.class,
-                                    isSelected ? 'active' : 'border-border/40'
+                                    'flex w-full flex-col gap-1.5 rounded-xl border px-3 py-2.5 text-left',
+                                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                                    'touch-manipulation cursor-pointer transition-colors',
+                                    'active:bg-interactive-hover',
+                                    isSelected 
+                                        ? 'border-primary/50 bg-interactive-selection/20' 
+                                        : 'border-border/40 hover:bg-interactive-hover/50'
                                 )}
                                 onClick={() => handleAgentChange(agent.name)}
                             >
-                                <div className="flex items-center gap-1.5">
-                                    <div className={cn('h-2 w-2 rounded-full', agentColor.class)} />
+                                <div className="flex items-center gap-2">
+                                    <div className={cn('h-2.5 w-2.5 rounded-full flex-shrink-0', agentColor.class)} />
                                     <span
-                                        className="typography-meta font-medium text-foreground"
+                                        className="typography-ui-label font-semibold"
                                         style={isSelected ? { color: `var(${agentColor.var})` } : undefined}
                                     >
                                         {capitalizeAgentName(agent.name)}
                                     </span>
+                                    {isSelected && (
+                                        <RiCheckLine className="h-4 w-4 text-primary ml-auto flex-shrink-0" />
+                                    )}
                                 </div>
                                 {agent.description && (
-                                    <span className="typography-micro text-muted-foreground">
+                                    <span className="typography-meta text-muted-foreground pl-4.5">
                                         {agent.description}
                                     </span>
                                 )}
                             </button>
                         );
                     })}
-                    <div className="rounded-xl bg-transparent">
-                        <div className="flex items-center justify-between px-2 py-2">
-                            <span className={cn(
-                                'typography-meta font-medium',
-                                approveEditsDisabled ? 'text-muted-foreground' : 'text-foreground'
-                            )}>
-                                Auto-approve edits
-                            </span>
-                            <Switch
-                                checked={approveEditsChecked}
-                                disabled={approveEditsDisabled}
-                                onCheckedChange={handleApproveEditsToggle}
-                            />
-                        </div>
-                    </div>
                 </div>
             </MobileOverlayPanel>
         );
@@ -1897,6 +1959,44 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
         const showProviderLogo = keyPrefix === 'fav' || keyPrefix === 'recent';
 
+        // Build animated metadata slides for desktop
+        const priceText = formatCompactPrice(metadata);
+        const hasPrice = priceText !== null;
+        const hasCapabilities = indicatorIcons.length > 0;
+
+        // Build slides array: price first, then capabilities
+        const slides: React.ReactNode[] = [];
+        if (hasPrice) {
+            slides.push(
+                <span key="price" className="typography-micro text-muted-foreground whitespace-nowrap">
+                    {priceText}
+                </span>
+            );
+        }
+        if (hasCapabilities) {
+            slides.push(
+                <div key="capabilities" className="flex items-center gap-0.5">
+                    {indicatorIcons.map(({ id, icon: Icon, label }) => (
+                        <span
+                            key={id}
+                            className="flex h-3.5 w-3.5 items-center justify-center text-muted-foreground"
+                            aria-label={label}
+                            role="img"
+                            title={label}
+                        >
+                            <Icon className="h-2.5 w-2.5" />
+                        </span>
+                    ))}
+                </div>
+            );
+        }
+
+        // Rotate metadata in interactive desktop-style pickers (web/desktop), keep VS Code static.
+        const supportsRotatingMetadata = !isVSCodeRuntime;
+        const shouldAnimate = supportsRotatingMetadata && slides.length > 1 && (isHighlighted || isSelected);
+        const staticSlideIndex = !supportsRotatingMetadata && hasCapabilities && hasPrice ? 1 : 0;
+        const staticMetadataSlide = slides[staticSlideIndex];
+
         return (
             <div
                 key={`${keyPrefix}-${providerID}-${modelID}`}
@@ -1922,19 +2022,22 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     ) : null}
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
-                    {indicatorIcons.length > 0 && (
-                        <div className={cn("items-center gap-0.5", isHighlighted ? "flex" : "hidden group-hover:flex")}>
-                            {indicatorIcons.map(({ id, icon: Icon, label }) => (
-                                <span
-                                    key={id}
-                                    className="flex h-3.5 w-3.5 items-center justify-center text-muted-foreground"
-                                    aria-label={label}
-                                    role="img"
-                                    title={label}
-                                >
-                                    <Icon className="h-2.5 w-2.5" />
-                                </span>
-                            ))}
+                    {/* Metadata slot: animated TextLoop for desktop highlighted/selected rows, static otherwise */}
+                    {slides.length > 0 && (
+                        <div className={cn(
+                            "items-center",
+                            shouldAnimate ? "flex w-[140px] justify-end" : ((isHighlighted || isSelected) ? "flex" : "hidden group-hover:flex")
+                        )}>
+                            {shouldAnimate ? (
+                                <TextLoop interval={2.1} transition={{ duration: 0.25 }} trigger={shouldAnimate}>
+                                    {slides}
+                                </TextLoop>
+                            ) : (
+                                <>
+                                    {/* In static runtimes (VS Code), prefer capabilities over price when both exist. */}
+                                    {staticMetadataSlide}
+                                </>
+                            )}
                         </div>
                     )}
                     {isSelected && (
@@ -1964,12 +2067,12 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         );
     };
 
-    // Filter models based on search query (fuzzy match)
+    // Filter models based on search query
     const filterByQuery = (modelName: string, providerName: string, query: string) => {
         if (!query.trim()) return true;
         return (
-            fuzzyMatch(modelName, query) ||
-            fuzzyMatch(providerName, query)
+            matchesModelSearch(modelName, query) ||
+            matchesModelSearch(providerName, query)
         );
     };
 
@@ -2024,9 +2127,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
         // Handle keyboard navigation
         const handleModelKeyDown = (e: React.KeyboardEvent) => {
+            e.stopPropagation();
+
             if (e.key === 'ArrowDown') {
                 e.preventDefault();
-                e.stopPropagation();
                 setModelSelectedIndex((prev) => (prev + 1) % Math.max(1, totalItems));
                 // Scroll into view
                 setTimeout(() => {
@@ -2035,7 +2139,6 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 }, 0);
             } else if (e.key === 'ArrowUp') {
                 e.preventDefault();
-                e.stopPropagation();
                 setModelSelectedIndex((prev) => (prev - 1 + Math.max(1, totalItems)) % Math.max(1, totalItems));
                 // Scroll into view
                 setTimeout(() => {
@@ -2044,14 +2147,12 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 }, 0);
             } else if (e.key === 'Enter') {
                 e.preventDefault();
-                e.stopPropagation();
                 const selectedItem = flatModelList[modelSelectedIndex];
                 if (selectedItem) {
                     handleProviderAndModelChange(selectedItem.providerID, selectedItem.modelID);
                 }
             } else if (e.key === 'Escape') {
                 e.preventDefault();
-                e.stopPropagation();
                 setAgentMenuOpen(false);
             }
         };
@@ -2492,6 +2593,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                             placeholder="Search agents"
                                             value={agentSearchQuery}
                                             onChange={(e) => setAgentSearchQuery(e.target.value)}
+                                            onKeyDown={(e) => {
+                                                e.stopPropagation();
+                                            }}
                                             className="pl-8 h-8 typography-meta"
                                             autoFocus
                                         />

@@ -1,5 +1,4 @@
 import express from 'express';
-import { createProxyMiddleware } from 'http-proxy-middleware';
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
@@ -10,6 +9,7 @@ import os from 'os';
 import crypto from 'crypto';
 import { createUiAuth } from './lib/ui-auth.js';
 import { startCloudflareTunnel, printTunnelWarning, checkCloudflaredAvailable } from './lib/cloudflare-tunnel.js';
+import { prepareNotificationLastMessage } from './lib/notification-message.js';
 import {
   TERMINAL_INPUT_WS_MAX_PAYLOAD_BYTES,
   TERMINAL_INPUT_WS_PATH,
@@ -281,7 +281,10 @@ const resolveWorkspacePathFromWorktrees = async (targetPath, baseDirectory) => {
     const worktrees = await getWorktrees(resolvedBase);
 
     for (const worktree of worktrees) {
-      const candidate = typeof worktree?.worktree === 'string' ? normalizeDirectoryPath(worktree.worktree) : '';
+      const candidatePath = typeof worktree?.path === 'string'
+        ? worktree.path
+        : (typeof worktree?.worktree === 'string' ? worktree.worktree : '');
+      const candidate = normalizeDirectoryPath(candidatePath);
       if (!candidate) {
         continue;
       }
@@ -572,7 +575,92 @@ const resolveNotificationTemplate = (template, variables) => {
   });
 };
 
-const summarizeText = async (text, targetLength) => {
+const shouldApplyResolvedTemplateMessage = (template, resolved, variables) => {
+  if (!resolved) {
+    return false;
+  }
+
+  if (typeof template !== 'string') {
+    return true;
+  }
+
+  if (template.includes('{last_message}')) {
+    return typeof variables?.last_message === 'string' && variables.last_message.trim().length > 0;
+  }
+
+  return true;
+};
+
+const ZEN_DEFAULT_MODEL = 'gpt-5-nano';
+
+/**
+ * Validated fallback zen model determined at startup by checking available free
+ * models from the zen API. When `null`, startup validation hasn't run yet (or
+ * failed), so `resolveZenModel` falls back to `ZEN_DEFAULT_MODEL`.
+ */
+let validatedZenFallback = null;
+
+/** Cached free zen models response and timestamp (shared by startup + endpoint). */
+let cachedZenModels = null;
+let cachedZenModelsTimestamp = 0;
+const ZEN_MODELS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Fetch free models from the zen API with caching. Returns an array of
+ * `{ id, owned_by }` objects (may be empty on failure). Results are cached
+ * for `ZEN_MODELS_CACHE_TTL` ms.
+ */
+const fetchFreeZenModels = async () => {
+  const now = Date.now();
+  if (cachedZenModels && now - cachedZenModelsTimestamp < ZEN_MODELS_CACHE_TTL) {
+    return cachedZenModels.models;
+  }
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeout = controller ? setTimeout(() => controller.abort(), 8000) : null;
+  try {
+    const response = await fetch('https://opencode.ai/zen/v1/models', {
+      signal: controller?.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      throw new Error(`zen/v1/models responded with status ${response.status}`);
+    }
+    const data = await response.json();
+    const allModels = Array.isArray(data?.data) ? data.data : [];
+    const freeModels = allModels
+      .filter((m) => typeof m?.id === 'string' && m.id.endsWith('-free'))
+      .map((m) => ({ id: m.id, owned_by: m.owned_by }));
+
+    cachedZenModels = { models: freeModels };
+    cachedZenModelsTimestamp = Date.now();
+    return freeModels;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
+/**
+ * Resolve the zen model to use. Checks the provided override first,
+ * then falls back to the stored zenModel setting, then to the validated
+ * startup fallback, then to the hardcoded default.
+ */
+const resolveZenModel = async (override) => {
+  if (typeof override === 'string' && override.trim().length > 0) {
+    return override.trim();
+  }
+  try {
+    const settings = await readSettingsFromDisk();
+    if (typeof settings?.zenModel === 'string' && settings.zenModel.trim().length > 0) {
+      return settings.zenModel.trim();
+    }
+  } catch {
+    // ignore
+  }
+  return validatedZenFallback || ZEN_DEFAULT_MODEL;
+};
+
+const summarizeText = async (text, targetLength, zenModel) => {
   if (!text || typeof text !== 'string' || text.trim().length === 0) return text;
 
   try {
@@ -585,7 +673,7 @@ const summarizeText = async (text, targetLength) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'gpt-5-nano',
+          model: zenModel || ZEN_DEFAULT_MODEL,
           input: [{ role: 'user', content: prompt }],
           max_output_tokens: 1000,
           stream: false,
@@ -679,7 +767,10 @@ const fetchLastAssistantMessageText = async (sessionId, messageId, maxLength = N
     const url = buildOpenCodeUrl(`/session/${encodeURIComponent(sessionId)}/message`, '');
     const response = await fetch(`${url}?limit=5`, {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      headers: {
+        Accept: 'application/json',
+        ...getOpenCodeAuthHeaders(),
+      },
       signal: AbortSignal.timeout(3000),
     });
 
@@ -1432,6 +1523,10 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.gitmojiEnabled === 'boolean') {
     result.gitmojiEnabled = candidate.gitmojiEnabled;
   }
+  if (typeof candidate.zenModel === 'string') {
+    const trimmed = candidate.zenModel.trim();
+    result.zenModel = trimmed.length > 0 ? trimmed : undefined;
+  }
   if (typeof candidate.toolCallExpansion === 'string') {
     const mode = candidate.toolCallExpansion.trim();
     if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed') {
@@ -1488,15 +1583,9 @@ const sanitizeSettingsUpdate = (payload) => {
     }
   }
 
-  // Memory limits for message viewport management
-  if (typeof candidate.memoryLimitHistorical === 'number' && Number.isFinite(candidate.memoryLimitHistorical)) {
-    result.memoryLimitHistorical = Math.max(10, Math.min(500, Math.round(candidate.memoryLimitHistorical)));
-  }
-  if (typeof candidate.memoryLimitViewport === 'number' && Number.isFinite(candidate.memoryLimitViewport)) {
-    result.memoryLimitViewport = Math.max(20, Math.min(500, Math.round(candidate.memoryLimitViewport)));
-  }
-  if (typeof candidate.memoryLimitActiveSession === 'number' && Number.isFinite(candidate.memoryLimitActiveSession)) {
-    result.memoryLimitActiveSession = Math.max(30, Math.min(1000, Math.round(candidate.memoryLimitActiveSession)));
+  // Message limit — single setting for fetch / trim / Load More chunk
+  if (typeof candidate.messageLimit === 'number' && Number.isFinite(candidate.messageLimit)) {
+    result.messageLimit = Math.max(10, Math.min(500, Math.round(candidate.messageLimit)));
   }
 
   const skillCatalogs = sanitizeSkillCatalogs(candidate.skillCatalogs);
@@ -2668,6 +2757,7 @@ let openCodeApiDetectionTimer = null;
 let lastOpenCodeError = null;
 let isOpenCodeReady = false;
 let openCodeNotReadySince = 0;
+let isExternalOpenCode = false;
 let exitOnShutdown = true;
 let uiAuthController = null;
 let cloudflareTunnelController = null;
@@ -2716,6 +2806,36 @@ async function isOpenCodeProcessHealthy() {
       signal: AbortSignal.timeout(2000),
     });
     return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Probe if an external OpenCode instance is already running on the given port.
+ * Unlike isOpenCodeProcessHealthy(), this doesn't require openCodeProcess to be set.
+ * Used to auto-detect and connect to an existing OpenCode instance on startup.
+ */
+async function probeExternalOpenCode(port) {
+  if (!port || port <= 0) {
+    return false;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(`http://127.0.0.1:${port}/global/health`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        ...getOpenCodeAuthHeaders(),
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => null);
+    return body?.healthy === true;
   } catch {
     return false;
   }
@@ -3857,23 +3977,17 @@ const maybeSendPushForTrigger = async (payload) => {
           lastMessage = await fetchLastAssistantMessageText(sessionId, messageId);
         }
 
-        // Summarize if enabled and above threshold, otherwise truncate to maxLastMessageLength
-        if (settings.summarizeLastMessage && lastMessage.length > (settings.summaryThreshold || 200)) {
-          lastMessage = await summarizeText(lastMessage, settings.summaryLength || 100);
-        } else {
-          const maxLen = typeof settings.maxLastMessageLength === 'number' && settings.maxLastMessageLength > 0
-            ? settings.maxLastMessageLength
-            : 250;
-          if (lastMessage.length > maxLen) {
-            lastMessage = lastMessage.slice(0, maxLen) + '...';
-          }
-        }
-        variables.last_message = lastMessage;
+        const notifZenModel = await resolveZenModel(settings?.zenModel);
+        variables.last_message = await prepareNotificationLastMessage({
+          message: lastMessage,
+          settings,
+          summarize: (text, len) => summarizeText(text, len, notifZenModel),
+        });
 
         const resolvedTitle = resolveNotificationTemplate(completionTemplate.title, variables);
         const resolvedBody = resolveNotificationTemplate(completionTemplate.message, variables);
         if (resolvedTitle) title = resolvedTitle;
-        if (resolvedBody) body = resolvedBody;
+        if (shouldApplyResolvedTemplateMessage(completionTemplate.message, resolvedBody, variables)) body = resolvedBody;
       } catch (err) {
         console.warn('[Notification] Template resolution failed, using defaults:', err?.message || err);
       }
@@ -3924,24 +4038,18 @@ const maybeSendPushForTrigger = async (payload) => {
           lastMessage = await fetchLastAssistantMessageText(sessionId, errorMessageId);
         }
 
-        // Summarize if enabled and above threshold, otherwise truncate to maxLastMessageLength
-        if (settings.summarizeLastMessage && lastMessage.length > (settings.summaryThreshold || 200)) {
-          lastMessage = await summarizeText(lastMessage, settings.summaryLength || 100);
-        } else {
-          const maxLen = typeof settings.maxLastMessageLength === 'number' && settings.maxLastMessageLength > 0
-            ? settings.maxLastMessageLength
-            : 250;
-          if (lastMessage.length > maxLen) {
-            lastMessage = lastMessage.slice(0, maxLen) + '...';
-          }
-        }
-        variables.last_message = lastMessage;
+        const errZenModel = await resolveZenModel(settings?.zenModel);
+        variables.last_message = await prepareNotificationLastMessage({
+          message: lastMessage,
+          settings,
+          summarize: (text, len) => summarizeText(text, len, errZenModel),
+        });
 
         const errorTemplate = (settings.notificationTemplates || {}).error || { title: 'Tool error', message: '{last_message}' };
         const resolvedTitle = resolveNotificationTemplate(errorTemplate.title, variables);
         const resolvedBody = resolveNotificationTemplate(errorTemplate.message, variables);
         if (resolvedTitle) title = resolvedTitle;
-        if (resolvedBody) body = resolvedBody;
+        if (shouldApplyResolvedTemplateMessage(errorTemplate.message, resolvedBody, variables)) body = resolvedBody;
       } catch (err) {
         console.warn('[Notification] Error template resolution failed, using defaults:', err?.message || err);
       }
@@ -4023,7 +4131,7 @@ const maybeSendPushForTrigger = async (payload) => {
         const resolvedTitle = resolveNotificationTemplate(questionTemplate.title, variables);
         const resolvedBody = resolveNotificationTemplate(questionTemplate.message, variables);
         if (resolvedTitle) title = resolvedTitle;
-        if (resolvedBody) body = resolvedBody;
+        if (shouldApplyResolvedTemplateMessage(questionTemplate.message, resolvedBody, variables)) body = resolvedBody;
       } catch (err) {
         console.warn('[Notification] Question template resolution failed, using defaults:', err?.message || err);
       }
@@ -4115,7 +4223,7 @@ const maybeSendPushForTrigger = async (payload) => {
         const resolvedTitle = resolveNotificationTemplate(questionTemplate.title, variables);
         const resolvedBody = resolveNotificationTemplate(questionTemplate.message, variables);
         if (resolvedTitle) title = resolvedTitle;
-        if (resolvedBody) body = resolvedBody;
+        if (shouldApplyResolvedTemplateMessage(questionTemplate.message, resolvedBody, variables)) body = resolvedBody;
       } catch (err) {
         console.warn('[Notification] Permission template resolution failed, using defaults:', err?.message || err);
       }
@@ -4332,6 +4440,31 @@ async function restartOpenCode() {
     isOpenCodeReady = false;
     openCodeNotReadySince = Date.now();
     console.log('Restarting OpenCode process...');
+
+    // For external OpenCode servers, re-probe instead of kill + respawn
+    if (isExternalOpenCode) {
+      console.log('Re-probing external OpenCode server...');
+      const probePort = openCodePort || ENV_CONFIGURED_OPENCODE_PORT || 4096;
+      const healthy = await probeExternalOpenCode(probePort);
+      if (healthy) {
+        console.log(`External OpenCode server on port ${probePort} is healthy`);
+        setOpenCodePort(probePort);
+        isOpenCodeReady = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
+      } else {
+        lastOpenCodeError = `External OpenCode server on port ${probePort} is not responding`;
+        console.error(lastOpenCodeError);
+        throw new Error(lastOpenCodeError);
+      }
+
+      if (expressApp) {
+        setupProxy(expressApp);
+        ensureOpenCodeApiPrefix();
+      }
+      return;
+    }
 
     const portToKill = openCodePort;
 
@@ -4630,6 +4763,157 @@ function setupProxy(app) {
     next();
   });
 
+  const isSseApiPath = (path) => path === '/event' || path === '/global/event';
+
+  const forwardSseRequest = async (req, res) => {
+    const startedAt = Date.now();
+    const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+    const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    const requestHeaders = {
+      ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : { accept: 'text/event-stream' }),
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+    };
+
+    const controller = new AbortController();
+    let connectTimer = null;
+    let idleTimer = null;
+    let heartbeatTimer = null;
+    let endedBy = 'upstream-end';
+
+    const cleanup = () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      req.off('close', onClientClose);
+    };
+
+    const resetIdleTimeout = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+      }
+      idleTimer = setTimeout(() => {
+        endedBy = 'idle-timeout';
+        controller.abort();
+      }, 5 * 60 * 1000);
+    };
+
+    const onClientClose = () => {
+      endedBy = 'client-disconnect';
+      controller.abort();
+    };
+
+    req.on('close', onClientClose);
+
+    try {
+      connectTimer = setTimeout(() => {
+        endedBy = 'connect-timeout';
+        controller.abort();
+      }, 10 * 1000);
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method: 'GET',
+        headers: requestHeaders,
+        signal: controller.signal,
+      });
+
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+
+      if (!upstreamResponse.ok || !upstreamResponse.body) {
+        const body = await upstreamResponse.text().catch(() => '');
+        cleanup();
+        if (!res.headersSent) {
+          if (upstreamResponse.headers.has('content-type')) {
+            res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+          }
+          res.status(upstreamResponse.status).send(body);
+        }
+        return;
+      }
+
+      const upstreamContentType = upstreamResponse.headers.get('content-type') || 'text/event-stream';
+      res.status(upstreamResponse.status);
+      res.setHeader('content-type', upstreamContentType);
+      res.setHeader('cache-control', 'no-cache');
+      res.setHeader('connection', 'keep-alive');
+      res.setHeader('x-accel-buffering', 'no');
+      res.setHeader('x-content-type-options', 'nosniff');
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      resetIdleTimeout();
+      heartbeatTimer = setInterval(() => {
+        if (res.writableEnded || controller.signal.aborted) {
+          return;
+        }
+        try {
+          res.write(': ping\n\n');
+          resetIdleTimeout();
+        } catch {
+        }
+      }, 30 * 1000);
+
+      const reader = upstreamResponse.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            endedBy = endedBy === 'upstream-end' ? 'upstream-finished' : endedBy;
+            break;
+          }
+          if (controller.signal.aborted) {
+            break;
+          }
+          if (value && value.length > 0) {
+            res.write(Buffer.from(value));
+            resetIdleTimeout();
+          }
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+        }
+      }
+
+      cleanup();
+      if (!res.writableEnded) {
+        res.end();
+      }
+      console.log(`SSE forward ${upstreamPath} closed (${endedBy}) in ${Date.now() - startedAt}ms`);
+    } catch (error) {
+      cleanup();
+      const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+      if (!res.headersSent) {
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode SSE forward timed out' : 'OpenCode SSE forward failed',
+        });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+      console.warn(`SSE forward ${upstreamPath} failed (${endedBy}):`, error?.message || error);
+    }
+  };
+
+  app.get('/api/event', forwardSseRequest);
+  app.get('/api/global/event', forwardSseRequest);
+
   app.use('/api', (_req, _res, next) => {
     ensureOpenCodeApiPrefix();
     next();
@@ -4651,66 +4935,162 @@ function setupProxy(app) {
   });
 
 
-  const proxyMiddleware = createProxyMiddleware({
-    target: openCodePort ? `http://localhost:${openCodePort}` : 'http://127.0.0.1:0',
-    router: () => {
-      if (!openCodePort) {
-        return 'http://127.0.0.1:0';
+  const hopByHopRequestHeaders = new Set([
+    'host',
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'keep-alive',
+    'te',
+    'trailer',
+    'upgrade',
+  ]);
+
+  const hopByHopResponseHeaders = new Set([
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'keep-alive',
+    'te',
+    'trailer',
+    'upgrade',
+    'www-authenticate',
+  ]);
+
+  const collectForwardHeaders = (req) => {
+    const authHeaders = getOpenCodeAuthHeaders();
+    const headers = {};
+
+    for (const [key, value] of Object.entries(req.headers || {})) {
+      if (!value) continue;
+      const lowerKey = key.toLowerCase();
+      if (hopByHopRequestHeaders.has(lowerKey)) continue;
+      headers[lowerKey] = Array.isArray(value) ? value.join(', ') : String(value);
+    }
+
+    if (authHeaders.Authorization) {
+      headers.Authorization = authHeaders.Authorization;
+    }
+
+    return headers;
+  };
+
+  const collectRequestBodyBuffer = async (req) => {
+    if (Buffer.isBuffer(req.body)) {
+      return req.body;
+    }
+
+    if (typeof req.body === 'string') {
+      return Buffer.from(req.body);
+    }
+
+    if (req.body && typeof req.body === 'object') {
+      return Buffer.from(JSON.stringify(req.body));
+    }
+
+    if (req.readableEnded) {
+      return Buffer.alloc(0);
+    }
+
+    return await new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on('data', (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
+  };
+
+  const forwardGenericApiRequest = async (req, res) => {
+    try {
+      const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const headers = collectForwardHeaders(req);
+      const method = String(req.method || 'GET').toUpperCase();
+      const hasBody = method !== 'GET' && method !== 'HEAD';
+      const bodyBuffer = hasBody ? await collectRequestBodyBuffer(req) : null;
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method,
+        headers,
+        body: hasBody ? bodyBuffer : undefined,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      for (const [key, value] of upstreamResponse.headers.entries()) {
+        const lowerKey = key.toLowerCase();
+        if (hopByHopResponseHeaders.has(lowerKey)) {
+          continue;
+        }
+        res.setHeader(key, value);
       }
-      return `http://localhost:${openCodePort}`;
-    },
-    changeOrigin: true,
-    pathRewrite: (path) => {
-      if (!path.startsWith('/api')) {
-        return path;
+
+      const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode request timed out' : 'OpenCode service unavailable',
+        });
+      }
+    }
+  };
+
+  // Dedicated forwarder for large session message payloads.
+  // This avoids edge-cases in generic proxy streaming for multi-file attachments.
+  app.post('/api/session/:sessionId/message', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    try {
+      const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const headers = {
+        ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+        ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+        ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+      };
+
+      const bodyBuffer = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: bodyBuffer,
+        signal: AbortSignal.timeout(45000),
+      });
+
+      const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+      if (upstreamResponse.headers.has('content-type')) {
+        res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
       }
 
-      const suffix = path.slice(4) || '/';
-
-      return suffix;
-    },
-    ws: false,
-    // v3.x API: callbacks go in 'on' object
-    on: {
-      error: (err, req, res) => {
-        console.error(`Proxy error: ${err.message}`);
-        if (!res.headersSent) {
-          res.status(503).json({ error: 'OpenCode service unavailable' });
-        }
-      },
-      proxyReq: (proxyReq, req, res) => {
-        console.log(`Proxying ${req.method} ${req.path} to OpenCode`);
-        const authHeaders = getOpenCodeAuthHeaders();
-        if (authHeaders.Authorization) {
-          proxyReq.setHeader('Authorization', authHeaders.Authorization);
-        }
-
-        if (req.headers.accept && req.headers.accept.includes('text/event-stream')) {
-          proxyReq.setHeader('Accept', 'text/event-stream');
-          proxyReq.setHeader('Cache-Control', 'no-cache');
-          proxyReq.setHeader('Connection', 'keep-alive');
-        }
-      },
-      proxyRes: (proxyRes, req, res) => {
-        // Strip WWW-Authenticate to prevent browser's native Basic Auth popup
-        if (proxyRes.headers['www-authenticate']) {
-          delete proxyRes.headers['www-authenticate'];
-        }
-
-        if (req.url?.includes('/event')) {
-          proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-          proxyRes.headers['Access-Control-Allow-Headers'] = 'Cache-Control, Accept';
-          proxyRes.headers['Content-Type'] = 'text/event-stream';
-          proxyRes.headers['Cache-Control'] = 'no-cache';
-          proxyRes.headers['Connection'] = 'keep-alive';
-          proxyRes.headers['X-Accel-Buffering'] = 'no';
-          proxyRes.headers['X-Content-Type-Options'] = 'nosniff';
-        }
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode message forward timed out' : 'OpenCode message forward failed',
+        });
       }
     }
   });
 
-  app.use('/api', proxyMiddleware);
+  app.use('/api', (req, res, next) => {
+    if (isSseApiPath(req.path)) {
+      return next();
+    }
+
+    if (req.method === 'POST' && /\/session\/[^/]+\/message$/.test(req.path || '')) {
+      return next();
+    }
+
+    return forwardGenericApiRequest(req, res);
+  });
 }
 
 function startHealthMonitoring() {
@@ -4766,7 +5146,7 @@ async function gracefulShutdown(options = {}) {
   }
 
   // Only stop OpenCode if we started it ourselves (not when using external server)
-  if (!ENV_SKIP_OPENCODE_START) {
+  if (!ENV_SKIP_OPENCODE_START && !isExternalOpenCode) {
     const portToKill = openCodePort;
 
     if (openCodeProcess) {
@@ -4855,6 +5235,36 @@ async function main(options = {}) {
     }
   } else {
     sayTTSCapability = { available: false, voices: [], reason: 'Not macOS' };
+  }
+
+  // Validate stored zen model at startup – best-effort, never blocks startup
+  try {
+    const freeModels = await fetchFreeZenModels();
+    const freeModelIds = freeModels.map((m) => m.id);
+
+    if (freeModelIds.length > 0) {
+      // Set the validated fallback to the first available free model
+      validatedZenFallback = freeModelIds[0];
+
+      const settings = await readSettingsFromDisk();
+      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
+
+      if (!storedModel || !freeModelIds.includes(storedModel)) {
+        const fallback = freeModelIds[0];
+        console.log(
+          storedModel
+            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
+            : `[zen] No model configured, setting default to "${fallback}"`
+        );
+        await persistSettings({ zenModel: fallback });
+      } else {
+        console.log(`[zen] Stored model "${storedModel}" verified as available`);
+      }
+    } else {
+      console.warn('[zen] No free models returned from API, skipping validation');
+    }
+  } catch (error) {
+    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
   }
 
   const app = express();
@@ -5115,7 +5525,8 @@ async function main(options = {}) {
       if (summarize && textToSpeak.length > threshold) {
         try {
           const { summarizeText } = await import('./lib/summarization-service.js');
-          const result = await summarizeText({ text: textToSpeak, threshold, maxLength });
+          const speakZenModel = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
+          const result = await summarizeText({ text: textToSpeak, threshold, maxLength, zenModel: speakZenModel });
           
           if (result.summarized && result.summary) {
             textToSpeak = result.summary;
@@ -5183,7 +5594,8 @@ async function main(options = {}) {
         return res.status(400).json({ error: 'Text is required' });
       }
 
-      const result = await summarizeText({ text, threshold, maxLength });
+      const sumZenModel = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
+      const result = await summarizeText({ text, threshold, maxLength, zenModel: sumZenModel });
 
       return res.json(result);
     } catch (error) {
@@ -5548,6 +5960,25 @@ async function main(options = {}) {
     } finally {
       if (timeout) {
         clearTimeout(timeout);
+      }
+    }
+  });
+
+  // Zen models endpoint - returns available free models from the zen API
+  app.get('/api/zen/models', async (_req, res) => {
+    try {
+      const models = await fetchFreeZenModels();
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.json({ models });
+    } catch (error) {
+      console.warn('Failed to fetch zen models:', error);
+      // Serve stale cache if available
+      if (cachedZenModels) {
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        res.json(cachedZenModels);
+      } else {
+        const statusCode = error?.name === 'AbortError' ? 504 : 502;
+        res.status(statusCode).json({ error: 'Failed to retrieve zen models' });
       }
     }
   });
@@ -7160,14 +7591,14 @@ async function main(options = {}) {
       const directory = typeof req.body?.directory === 'string' ? req.body.directory.trim() : '';
       const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
       const head = typeof req.body?.head === 'string' ? req.body.head.trim() : '';
-      const base = typeof req.body?.base === 'string' ? req.body.base.trim() : '';
+      const requestedBase = typeof req.body?.base === 'string' ? req.body.base.trim() : '';
       const body = typeof req.body?.body === 'string' ? req.body.body : undefined;
       const draft = typeof req.body?.draft === 'boolean' ? req.body.draft : undefined;
       // remote = target repo (where PR is created, e.g., 'upstream' for forks)
       const remote = typeof req.body?.remote === 'string' ? req.body.remote.trim() : 'origin';
       // headRemote = source repo (where head branch lives, e.g., 'origin' for forks)
       const headRemote = typeof req.body?.headRemote === 'string' ? req.body.headRemote.trim() : '';
-      if (!directory || !title || !head || !base) {
+      if (!directory || !title || !head || !requestedBase) {
         return res.status(400).json({ error: 'directory, title, head, base are required' });
       }
 
@@ -7183,13 +7614,42 @@ async function main(options = {}) {
         return res.status(400).json({ error: 'Unable to resolve GitHub repo from git remote' });
       }
 
+      const normalizeBranchRef = (value, remoteNames = new Set()) => {
+        if (!value) {
+          return value;
+        }
+        let normalized = value.trim();
+        if (normalized.startsWith('refs/heads/')) {
+          normalized = normalized.substring('refs/heads/'.length);
+        }
+        if (normalized.startsWith('heads/')) {
+          normalized = normalized.substring('heads/'.length);
+        }
+        if (normalized.startsWith('remotes/')) {
+          normalized = normalized.substring('remotes/'.length);
+        }
+
+        const slashIndex = normalized.indexOf('/');
+        if (slashIndex > 0) {
+          const maybeRemote = normalized.slice(0, slashIndex);
+          if (remoteNames.has(maybeRemote)) {
+            const withoutRemotePrefix = normalized.slice(slashIndex + 1).trim();
+            if (withoutRemotePrefix) {
+              normalized = withoutRemotePrefix;
+            }
+          }
+        }
+
+        return normalized;
+      };
+
       // Determine the source remote for the head branch
       // Priority: 1) explicit headRemote, 2) tracking branch remote, 3) 'origin' if targeting non-origin
       let sourceRemote = headRemote;
+      const { getStatus, getRemotes } = await import('./lib/git-service.js');
       
       // If no explicit headRemote, check the branch's tracking info
       if (!sourceRemote) {
-        const { getStatus } = await import('./lib/git-service.js');
         const status = await getStatus(directory).catch(() => null);
         if (status?.tracking) {
           // tracking is like "gsxdsm/fix/multi-remote-branch-creation" or "origin/main"
@@ -7203,6 +7663,22 @@ async function main(options = {}) {
       // Fallback: if targeting non-origin and no tracking info, try 'origin'
       if (!sourceRemote && remote !== 'origin') {
         sourceRemote = 'origin';
+      }
+
+      const remoteNames = new Set([remote]);
+      const remotes = await getRemotes(directory).catch(() => []);
+      for (const item of remotes) {
+        if (item?.name) {
+          remoteNames.add(item.name);
+        }
+      }
+      if (sourceRemote) {
+        remoteNames.add(sourceRemote);
+      }
+
+      const base = normalizeBranchRef(requestedBase, remoteNames);
+      if (!base) {
+        return res.status(400).json({ error: 'Invalid base branch name' });
       }
 
       // For fork workflows: we need to determine the correct head reference
@@ -7665,6 +8141,7 @@ async function main(options = {}) {
               repo: pr.head.repo.name,
               url: pr.head.repo.html_url,
               cloneUrl: pr.head.repo.clone_url,
+              sshUrl: pr.head.repo.ssh_url,
             }
           : null;
         return {
@@ -7732,6 +8209,7 @@ async function main(options = {}) {
             repo: prData.head.repo.name,
             url: prData.head.repo.html_url,
             cloneUrl: prData.head.repo.clone_url,
+            sshUrl: prData.head.repo.ssh_url,
           }
         : null;
 
@@ -8478,9 +8956,38 @@ async function main(options = {}) {
         })
         .join('\n\n');
 
-      const prompt = `You are drafting git commit notes for this codebase. Respond in JSON of the shape {"subject": string, "highlights": string[]} (ONLY the JSON in response, no markdown wrappers or anything except JSON) with these rules:\n- subject follows our convention: type[optional-scope]: summary (examples: "feat: add diff virtualization", "fix(chat): restore enter key handling")\n- allowed types: feat, fix, chore, style, refactor, perf, docs, test, build, ci (choose the best match or fallback to chore)\n- summary must be imperative, concise, <= 70 characters, no trailing punctuation\n- scope is optional; include only when obvious from filenames/folders; do not invent scopes\n- focus on the most impactful user-facing change; if multiple capabilities ship together, align the subject with the dominant theme and use highlights to cover the other major outcomes\n- highlights array should contain 2-3 plain sentences (<= 90 chars each) that describe distinct features or UI changes users will notice (e.g. "Add per-file revert action in Changes list"). Avoid subjective benefit statements, marketing tone, repeating the subject, or referencing helper function names. Highlight additions such as new controls/buttons, new actions (e.g. revert), or stored state changes explicitly. Skip highlights if fewer than two meaningful points exist.\n- text must be plain (no markdown bullets); each highlight should start with an uppercase verb\n\nDiff summary:\n${diffSummaries}`;
+      const prompt = `You are generating a Conventional Commits subject line from the provided diff.
 
-      const model = 'gpt-5-nano';
+Return EXACTLY one JSON object (no code fences, no extra keys, no extra text):
+{"subject": string, "highlights": string[]}
+
+Non-negotiable:
+- Output must be valid JSON (double quotes).
+- Only claim what is supported by the diff. If unsure, be more general; do not guess.
+
+subject:
+- Format: <type>: <summary> (NO scope; never write type(scope))
+- Allowed types: feat, fix, refactor, perf, docs, test, build, ci, chore, style, revert
+- Choose type (prefer fix when ambiguous):
+  - fix: any bug/regression/wrong behavior (state, selection, navigation, persistence, crash)
+  - feat: new user-facing capability or new workflow (not just guardrails/defaults)
+  - refactor/perf/docs/test/build/ci/style/chore/revert: only when clearly the primary change
+- Summary style:
+  - imperative, present tense, outcome-first
+  - <= 72 characters, no trailing period
+  - avoid filenames, internal function names, and implementation details
+
+highlights:
+- 0-3 items; it is OK to return [].
+- Each item: one plain sentence, <= 90 chars, starts with an Uppercase verb.
+- Must add information not already in the subject.
+- Prefer user-observable behaviors (UI flow, navigation, selection, default view, persistence).
+- No markdown bullets, no file paths, no helper names.
+
+Diff summary (may be truncated):
+${diffSummaries}`;
+
+      const model = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
 
       const completionTimeout = createTimeoutSignal(LONG_REQUEST_TIMEOUT_MS);
       let response;
@@ -8593,7 +9100,7 @@ Context:
 
       prompt += `\n\nDiff summary:\n${diffSummaries}`;
 
-      const model = 'gpt-5-nano';
+      const model = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
 
       const completionTimeout = createTimeoutSignal(LONG_REQUEST_TIMEOUT_MS);
       let response;
@@ -9025,6 +9532,74 @@ Context:
       console.warn('Failed to get worktrees, returning empty list:', error?.message || error);
       res.setHeader('X-OpenChamber-Warning', 'git worktrees unavailable');
       res.json([]);
+    }
+  });
+
+  app.post('/api/git/worktrees/validate', async (req, res) => {
+    const { validateWorktreeCreate } = await getGitLibraries();
+    if (typeof validateWorktreeCreate !== 'function') {
+      return res.status(501).json({ error: 'Worktree validation is not available' });
+    }
+
+    try {
+      const directory = req.query.directory;
+      if (!directory || typeof directory !== 'string') {
+        return res.status(400).json({ error: 'directory parameter is required' });
+      }
+
+      const result = await validateWorktreeCreate(directory, req.body || {});
+      res.json(result);
+    } catch (error) {
+      console.error('Failed to validate worktree creation:', error);
+      res.status(500).json({ error: error.message || 'Failed to validate worktree creation' });
+    }
+  });
+
+  app.post('/api/git/worktrees', async (req, res) => {
+    const { createWorktree } = await getGitLibraries();
+    if (typeof createWorktree !== 'function') {
+      return res.status(501).json({ error: 'Worktree creation is not available' });
+    }
+
+    try {
+      const directory = req.query.directory;
+      if (!directory || typeof directory !== 'string') {
+        return res.status(400).json({ error: 'directory parameter is required' });
+      }
+
+      const created = await createWorktree(directory, req.body || {});
+      res.json(created);
+    } catch (error) {
+      console.error('Failed to create worktree:', error);
+      res.status(500).json({ error: error.message || 'Failed to create worktree' });
+    }
+  });
+
+  app.delete('/api/git/worktrees', async (req, res) => {
+    const { removeWorktree } = await getGitLibraries();
+    if (typeof removeWorktree !== 'function') {
+      return res.status(501).json({ error: 'Worktree removal is not available' });
+    }
+
+    try {
+      const directory = req.query.directory;
+      if (!directory || typeof directory !== 'string') {
+        return res.status(400).json({ error: 'directory parameter is required' });
+      }
+
+      const worktreeDirectory = typeof req.body?.directory === 'string' ? req.body.directory : '';
+      if (!worktreeDirectory) {
+        return res.status(400).json({ error: 'worktree directory is required' });
+      }
+
+      const result = await removeWorktree(directory, {
+        directory: worktreeDirectory,
+        deleteLocalBranch: req.body?.deleteLocalBranch === true,
+      });
+      res.json({ success: Boolean(result) });
+    } catch (error) {
+      console.error('Failed to remove worktree:', error);
+      res.status(500).json({ error: error.message || 'Failed to remove worktree' });
     }
   });
 
@@ -10311,6 +10886,23 @@ Context:
       console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
       setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
       isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
+      console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
+      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
+      console.log('Auto-detected existing OpenCode server on default port 4096');
+      setOpenCodePort(4096);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
       lastOpenCodeError = null;
       openCodeNotReadySince = 0;
       syncToHmrState();

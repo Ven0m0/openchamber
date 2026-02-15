@@ -9,6 +9,7 @@ import { RiLoader4Line } from '@remixicon/react';
 
 interface MobileSessionStatusBarProps {
   onSessionSwitch?: (sessionId: string) => void;
+  cornerRadius?: number;
 }
 
 interface SessionWithStatus extends Session {
@@ -183,6 +184,7 @@ function SessionItem({
   getSessionAgentName,
   getSessionTitle,
   onClick,
+  onDoubleClick,
   needsAttention
 }: {
   session: SessionWithStatus;
@@ -190,6 +192,7 @@ function SessionItem({
   getSessionAgentName: (s: Session) => string;
   getSessionTitle: (s: Session) => string;
   onClick: () => void;
+  onDoubleClick?: () => void;
   needsAttention: (sessionId: string) => boolean;
 }) {
   const agentName = getSessionAgentName(session);
@@ -200,6 +203,10 @@ function SessionItem({
     <button
       type="button"
       onClick={onClick}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onDoubleClick?.();
+      }}
       className={cn(
         "flex items-center gap-0.5 px-1.5 py-px text-left transition-colors",
         "hover:bg-[var(--interactive-hover)] active:bg-[var(--interactive-selection)]",
@@ -296,16 +303,24 @@ function CollapsedView({
   unreadCount,
   currentSessionTitle,
   onToggle,
-  onNewSession
+  onNewSession,
+  cornerRadius,
 }: {
   runningCount: number;
   unreadCount: number;
   currentSessionTitle: string;
   onToggle: () => void;
   onNewSession: () => void;
+  cornerRadius?: number;
 }) {
   return (
-    <div className="w-full flex items-center justify-between px-2 border-b border-[var(--interactive-border)] bg-[var(--surface-muted)] order-first text-left">
+    <div
+      className="w-full flex items-center justify-between px-2 border-b border-[var(--interactive-border)] bg-[var(--surface-muted)] order-first text-left overflow-hidden"
+      style={{
+        borderTopLeftRadius: cornerRadius,
+        borderTopRightRadius: cornerRadius,
+      }}
+    >
       <div className="flex-1 min-w-0 mr-2">
         <SessionStatusHeader
           currentSessionTitle={currentSessionTitle}
@@ -339,9 +354,11 @@ function ExpandedView({
   onToggleExpand,
   onNewSession,
   onSessionClick,
+  onSessionDoubleClick,
   getSessionAgentName,
   getSessionTitle,
-  needsAttention
+  needsAttention,
+  cornerRadius,
 }: {
   sessions: SessionWithStatus[];
   currentSessionId: string;
@@ -353,9 +370,11 @@ function ExpandedView({
   onToggleExpand: () => void;
   onNewSession: () => void;
   onSessionClick: (id: string) => void;
+  onSessionDoubleClick?: () => void;
   getSessionAgentName: (s: Session) => string;
   getSessionTitle: (s: Session) => string;
   needsAttention: (sessionId: string) => boolean;
+  cornerRadius?: number;
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [collapsedHeight, setCollapsedHeight] = React.useState<number | null>(null);
@@ -372,7 +391,13 @@ function ExpandedView({
   const displaySessions = hasMeasured || isExpanded ? sessions : sessions.slice(0, 3);
 
   return (
-    <div className="w-full border-b border-[var(--interactive-border)] bg-[var(--surface-muted)] order-first">
+    <div
+      className="w-full border-b border-[var(--interactive-border)] bg-[var(--surface-muted)] order-first overflow-hidden"
+      style={{
+        borderTopLeftRadius: cornerRadius,
+        borderTopRightRadius: cornerRadius,
+      }}
+    >
       <div className="flex items-center justify-between px-2 py-0">
         <div className="flex-1 min-w-0 mr-2">
           <SessionStatusHeader
@@ -419,6 +444,7 @@ function ExpandedView({
             getSessionAgentName={getSessionAgentName}
             getSessionTitle={getSessionTitle}
             onClick={() => onSessionClick(session.id)}
+            onDoubleClick={onSessionDoubleClick}
             needsAttention={needsAttention}
           />
         ))}
@@ -429,6 +455,7 @@ function ExpandedView({
 
 export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
   onSessionSwitch,
+  cornerRadius,
 }) => {
   const sessions = useSessionStore((state) => state.sessions);
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
@@ -438,6 +465,7 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
   const createSession = useSessionStore((state) => state.createSession);
   const agents = useConfigStore((state) => state.agents);
   const { isMobile, isMobileSessionStatusBarCollapsed, setIsMobileSessionStatusBarCollapsed } = useUIStore();
+  const setActiveMainTab = useUIStore((state) => state.setActiveMainTab);
   const [isExpanded, setIsExpanded] = React.useState(false);
 
   const { sessions: sortedSessions, totalRunning, totalUnread, totalCount } = useSessionGrouping(sessions, sessionStatus, sessionAttentionStates);
@@ -456,6 +484,11 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
     setIsExpanded(false);
   };
 
+  const handleSessionDoubleClick = () => {
+    // On double-tap, switch to the Chat tab
+    setActiveMainTab('chat');
+  };
+
   const handleCreateSession = async () => {
     const newSession = await createSession();
     if (newSession) {
@@ -472,6 +505,7 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
         currentSessionTitle={currentSessionTitle}
         onToggle={() => setIsMobileSessionStatusBarCollapsed(false)}
         onNewSession={handleCreateSession}
+        cornerRadius={cornerRadius}
       />
     );
   }
@@ -491,9 +525,11 @@ export const MobileSessionStatusBar: React.FC<MobileSessionStatusBarProps> = ({
       onToggleExpand={() => setIsExpanded(!isExpanded)}
       onNewSession={handleCreateSession}
       onSessionClick={handleSessionClick}
+      onSessionDoubleClick={handleSessionDoubleClick}
       getSessionAgentName={getSessionAgentName}
       getSessionTitle={getSessionTitle}
       needsAttention={needsAttention}
+      cornerRadius={cornerRadius}
     />
   );
 };

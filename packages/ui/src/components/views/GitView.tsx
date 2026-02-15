@@ -409,8 +409,6 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
   const [conflictDialogOpen, setConflictDialogOpen] = React.useState(false);
   const [conflictFiles, setConflictFiles] = React.useState<string[]>([]);
   const [conflictOperation, setConflictOperation] = React.useState<'merge' | 'rebase'>('merge');
-  const [pushRemoteDialogOpen, setPushRemoteDialogOpen] = React.useState(false);
-  const [pendingPushAction, setPendingPushAction] = React.useState<'commitAndPush' | null>(null);
 
   // Conflict state persistence key
   const conflictStorageKey = React.useMemo(() => {
@@ -727,22 +725,28 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
     });
   }, [status, changeEntries, hasUserAdjustedSelection]);
 
-  const handleSyncAction = async (action: Exclude<SyncAction, null>, remote: GitRemote) => {
+  const handleSyncAction = async (action: Exclude<SyncAction, null>, remote?: GitRemote) => {
     if (!currentDirectory) return;
     setSyncAction(action);
 
     try {
       if (action === 'fetch') {
+        if (!remote) {
+          throw new Error('No remote available for fetch');
+        }
         await git.gitFetch(currentDirectory, { remote: remote.name });
         toast.success(`Fetched from ${remote.name}`);
       } else if (action === 'pull') {
+        if (!remote) {
+          throw new Error('No remote available for pull');
+        }
         const result = await git.gitPull(currentDirectory, { remote: remote.name });
         toast.success(
           `Pulled ${result.files.length} file${result.files.length === 1 ? '' : 's'} from ${remote.name}`
         );
       } else if (action === 'push') {
-        await git.gitPush(currentDirectory, { remote: remote.name });
-        toast.success(`Pushed to ${remote.name}`);
+        await git.gitPush(currentDirectory);
+        toast.success('Pushed to upstream');
       }
 
       await refreshStatusAndBranches(false);
@@ -758,7 +762,7 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
     }
   };
 
-  const handleCommit = async (options: { pushAfter?: boolean; remote?: GitRemote } = {}) => {
+  const handleCommit = async (options: { pushAfter?: boolean } = {}) => {
     if (!currentDirectory) return;
     if (!commitMessage.trim()) {
       toast.error('Please enter a commit message');
@@ -770,17 +774,6 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
       toast.error('Select at least one file to commit');
       return;
     }
-
-    // If pushing with multiple remotes and no remote specified, this shouldn't happen anymore
-    // since CommitSection now uses a dropdown. But keep as fallback for safety.
-    if (options.pushAfter && remotes.length > 1 && !options.remote) {
-      setPendingPushAction('commitAndPush');
-      setPushRemoteDialogOpen(true);
-      return;
-    }
-
-    // If there's only one remote, use it automatically when no remote is specified
-    const targetRemote = options.remote ?? (remotes.length === 1 ? remotes[0] : undefined);
 
     const action: CommitAction = options.pushAfter ? 'commitAndPush' : 'commit';
     setCommitAction(action);
@@ -798,9 +791,8 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
       await refreshStatusAndBranches();
 
       if (options.pushAfter) {
-        const remoteName = targetRemote?.name;
-        await git.gitPush(currentDirectory, remoteName ? { remote: remoteName } : undefined);
-        toast.success(remoteName ? `Pushed to ${remoteName}` : 'Pushed to remote');
+        await git.gitPush(currentDirectory);
+        toast.success('Pushed to upstream');
         triggerFireworks();
         await refreshStatusAndBranches(false);
       } else {
@@ -817,19 +809,6 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
     }
   };
 
-  const handlePushRemoteSelect = (remote: GitRemote) => {
-    setPushRemoteDialogOpen(false);
-    if (pendingPushAction === 'commitAndPush') {
-      handleCommit({ pushAfter: true, remote });
-    }
-    setPendingPushAction(null);
-  };
-
-  const handlePushRemoteDialogClose = () => {
-    setPushRemoteDialogOpen(false);
-    setPendingPushAction(null);
-  };
-
   const handleGenerateCommitMessage = React.useCallback(async () => {
     if (!currentDirectory) return;
     if (selectedPaths.size === 0) {
@@ -839,9 +818,11 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
 
     setIsGeneratingMessage(true);
     try {
+      const zenModel = useConfigStore.getState().settingsZenModel;
       const { message } = await git.generateCommitMessage(
         currentDirectory,
-        Array.from(selectedPaths)
+        Array.from(selectedPaths),
+        zenModel ? { zenModel } : undefined
       );
       const subject = message.subject?.trim() ?? '';
       const highlights = Array.isArray(message.highlights) ? message.highlights : [];
@@ -1014,19 +995,58 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
   }, [remotes, remoteBranches, remoteUrl, status?.tracking]);
 
   const baseBranch = React.useMemo(() => {
-    const fromMeta = typeof worktreeMetadata?.createdFromBranch === 'string'
-      ? worktreeMetadata.createdFromBranch.trim()
-      : '';
-    if (fromMeta && fromMeta !== 'HEAD') return fromMeta;
+    const remoteNames = new Set(effectiveRemotes.map((remote) => remote.name));
+    const normalizeBaseCandidate = (value: string): string => {
+      if (!value) {
+        return '';
+      }
 
-    const fromHint = typeof rootBranchHint === 'string' ? rootBranchHint.trim() : '';
-    if (fromHint && fromHint !== 'HEAD') return fromHint;
+      let normalized = value.trim();
+      if (!normalized || normalized === 'HEAD') {
+        return '';
+      }
+
+      if (localBranches.includes(normalized)) {
+        return normalized;
+      }
+
+      if (normalized.startsWith('refs/heads/')) {
+        normalized = normalized.slice('refs/heads/'.length);
+      }
+      if (normalized.startsWith('heads/')) {
+        normalized = normalized.slice('heads/'.length);
+      }
+      if (normalized.startsWith('remotes/')) {
+        normalized = normalized.slice('remotes/'.length);
+      }
+
+      const slashIndex = normalized.indexOf('/');
+      if (slashIndex > 0) {
+        const maybeRemote = normalized.slice(0, slashIndex);
+        if (remoteNames.has(maybeRemote)) {
+          const withoutRemote = normalized.slice(slashIndex + 1).trim();
+          if (withoutRemote) {
+            normalized = withoutRemote;
+          }
+        }
+      }
+
+      return normalized;
+    };
+
+    const fromMeta = normalizeBaseCandidate(
+      typeof worktreeMetadata?.createdFromBranch === 'string' ? worktreeMetadata.createdFromBranch : ''
+    );
+    if (fromMeta) return fromMeta;
+
+    const fromHint = normalizeBaseCandidate(typeof rootBranchHint === 'string' ? rootBranchHint : '');
+    if (fromHint) return fromHint;
 
     if (localBranches.includes('main')) return 'main';
     if (localBranches.includes('master')) return 'master';
     if (localBranches.includes('develop')) return 'develop';
     return 'main';
-  }, [localBranches, rootBranchHint, worktreeMetadata?.createdFromBranch]);
+  }, [effectiveRemotes, localBranches, rootBranchHint, worktreeMetadata?.createdFromBranch]);
 
   const availableIdentities = React.useMemo(() => {
     const unique = new Map<string, GitIdentityProfile>();
@@ -1609,7 +1629,7 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
         remotes={effectiveRemotes}
         onFetch={(remote) => handleSyncAction('fetch', remote)}
         onPull={(remote) => handleSyncAction('pull', remote)}
-        onPush={(remote) => handleSyncAction('push', remote)}
+        onPush={() => handleSyncAction('push')}
         onCheckoutBranch={handleCheckoutBranch}
         onCreateBranch={handleCreateBranch}
         onRenameBranch={handleRenameBranch}
@@ -1695,12 +1715,11 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
                         onGenerateMessage={handleGenerateCommitMessage}
                         isGeneratingMessage={isGeneratingMessage}
                         onCommit={() => handleCommit({ pushAfter: false })}
-                        onCommitAndPush={(remote) => handleCommit({ pushAfter: true, remote })}
+                        onCommitAndPush={() => handleCommit({ pushAfter: true })}
                         commitAction={commitAction}
                         isBusy={isBusy}
                         gitmojiEnabled={settingsGitmojiEnabled}
                         onOpenGitmojiPicker={() => setIsGitmojiPickerOpen(true)}
-                        remotes={remotes}
                       />
                     </>
                   ) : (
@@ -1775,6 +1794,7 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
                     branch={pullRequestProps.branch}
                     baseBranch={baseBranch}
                     remotes={remotes}
+                    remoteBranches={remoteBranches}
                     onGeneratedDescription={scrollActionPanelToBottom}
                   />
                 ) : (
@@ -1882,34 +1902,6 @@ export const GitView: React.FC<GitViewProps> = ({ mode = 'full' }) => {
         onOpenChange={setIsBranchPickerOpen}
         project={branchPickerProject}
       />
-
-      <Dialog open={pushRemoteDialogOpen} onOpenChange={handlePushRemoteDialogClose}>
-        <DialogContent className="max-w-sm">
-          <DialogHeader>
-            <DialogTitle>Select remote</DialogTitle>
-            <DialogDescription>
-              Choose which remote to push to
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-col gap-2">
-            {remotes.map((remote) => (
-              <button
-                key={remote.name}
-                type="button"
-                onClick={() => handlePushRemoteSelect(remote)}
-                className="flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg text-left border border-border/60 hover:bg-accent hover:border-border transition-colors"
-              >
-                <span className="typography-ui-label text-foreground font-medium">
-                  {remote.name}
-                </span>
-                <span className="typography-meta text-muted-foreground truncate max-w-full">
-                  {remote.pushUrl}
-                </span>
-              </button>
-            ))}
-          </div>
-        </DialogContent>
-      </Dialog>
 
     </div>
   );
