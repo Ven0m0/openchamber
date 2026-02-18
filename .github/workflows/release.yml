@@ -31,7 +31,7 @@ jobs:
       release_upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get version
         id: get_version
@@ -95,7 +95,7 @@ jobs:
     outputs:
       version: ${{ needs.create-release.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup bun
         uses: oven-sh/setup-bun@v2
@@ -315,7 +315,7 @@ jobs:
     needs: create-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup bun
         uses: oven-sh/setup-bun@v2
