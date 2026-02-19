@@ -1,6 +1,6 @@
 diff --git a/node_modules/ghostty-web/dist/ghostty-web.js b/node_modules/ghostty-web/dist/ghostty-web.js
---- a/node_modules/ghostty-web/dist/ghostty-web.js	2026-02-19 07:11:11.232755302 +0000
-+++ b/node_modules/ghostty-web/dist/ghostty-web.js	2026-02-19 07:15:07.311691184 +0000
+--- a/node_modules/ghostty-web/dist/ghostty-web.js
++++ b/node_modules/ghostty-web/dist/ghostty-web.js
 @@ -1338,7 +1338,7 @@
      const g = A.getContext("2d", { alpha: !0 });
      if (!g)
