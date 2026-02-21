@@ -32,7 +32,7 @@ jobs:
       # ============================================================
       - name: Restore Session Data (Artifact)
         if: ${{ env.OPENCODE_SERVER_PASSWORD != '' }}
-        uses: dawidd6/action-download-artifact@v15
+        uses: dawidd6/action-download-artifact@v14
         continue-on-error: true
         with:
           name: opencode-session
@@ -222,7 +222,7 @@ jobs:
 
       - name: Upload Session Data (Artifact)
         if: ${{ always() && env.OPENCODE_SERVER_PASSWORD != '' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: opencode-session
           path: /tmp/opencode-save/
